@@ -17,7 +17,7 @@ services:
       - DOWNLOAD_DIR=/app/downloads
       - SESSION_DIR=/app/sessions
     ports:
-      - "8080:8080"
+      - "8000:8000"
     volumes:
       - ./downloads:/app/downloads
       - ./sessions:/app/sessions
