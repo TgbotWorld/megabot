@@ -7,15 +7,17 @@ WELCOME = """<blockquote>{} <b>MegaBot AI</b></blockquote>
 🤖 <b>Your Autonomous Cloud Downloader & File Assistant.</b>
 
 I am powered by an intelligent AI Agent with real tools to:
-📥 <b>Download:</b> MEGA.nz, MediaFire.com & MP4Upload.com at maximum speed
+📥 <b>Download:</b> MEGA.nz, MediaFire.com, MP4Upload.com & Direct CDN links at maximum speed
 📦 <b>Smart Unzip:</b> Automatically extracts ZIP, RAR, 7Z, and TAR archives
 🖼️ <b>Image Sets:</b> Merged into clean, ordered <b>PDFs</b>
 🎬 <b>Videos:</b> Stream-ready uploads with thumbnails
 🛠️ <b>Autonomous Tools:</b> Unzip files, delete storage, clean disk, and manage jobs!
+⚙️ <b>AI Control:</b> Change AI models, providers, and keys with <code>/aiconfig</code>
 
 💬 <b>Talk to me naturally:</b>
-• Paste any MEGA, MediaFire, or MP4Upload link
-• Or ask me to unzip files, delete storage, check stats, or cancel jobs!""".format(LOGO)
+• Paste any download link (MEGA, MediaFire, MP4Upload, etc.)
+• Send me files, documents, or videos directly
+• Or ask me to unzip files, delete storage, configure AI, or cancel jobs!""".format(LOGO)
 
 HELP = """<blockquote>{} <b>MegaBot AI Guide</b></blockquote>
 🤖 <b>How to Use Me:</b>
@@ -30,16 +32,24 @@ HELP = """<blockquote>{} <b>MegaBot AI Guide</b></blockquote>
 • <i>"Clean disk"</i> — frees up server storage
 • <i>"Show my jobs"</i> — lists active and queued downloads
 • <i>"Cancel job <id>"</i> — stops a running job
+• <i>"Change AI model to gpt-4o-mini"</i> — adjusts settings dynamically
 
-<b>Supported Hosts:</b> MEGA.nz • MediaFire.com • MP4Upload.com
+<b>Supported Hosts:</b> MEGA.nz • MediaFire.com • MP4Upload.com • TeraBox • Direct CDN Links
 <b>Supported Formats:</b> zip, rar, 7z, tar, iso • mp4, mkv • images → PDF • docs
 
 <b>Commands:</b>
 /start — Welcome & features
 /agent — AI Agent dashboard & status
+/aiconfig — Interactive AI configuration menu
+/setmodel &lt;model&gt; — Change active AI model
+/setprovider &lt;provider&gt; — Switch AI provider
+/setkey &lt;key&gt; — Set API key (auto-deleted for privacy)
+/settemp &lt;0.0-2.0&gt; — Set AI temperature
 /settings — Preferences (archive mode, PDF, thumbnails)
 /cancel — Cancel active job
-/login & /logout — Custom MEGA account""".format(LOGO)
+/terabox &lt;cookie&gt; — Set TeraBox ndus cookie
+/login &amp; /logout — Custom MEGA account
+/help — How to use the bot""".format(LOGO)
 
 BANNED = "🚫 You are banned from using this bot."
 

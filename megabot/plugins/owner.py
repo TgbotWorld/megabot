@@ -88,3 +88,20 @@ async def broadcast_cmd(client: Client, message: Message):
         except Exception:
             failed += 1
     await message.reply_text(f"📢 Broadcast done: ✅ {sent} sent, ❌ {failed} failed.")
+
+
+@Client.on_message(filters.command(["setcommands", "sync", "reloadcommands"]))
+@owner_only
+async def setcommands_cmd(client: Client, message: Message):
+    """Force re-register bot commands with Telegram servers in both Default and Private scopes."""
+    from main import set_bot_commands
+    status_msg = await message.reply_text("🔄 Syncing bot commands with Telegram servers...")
+    ok = await set_bot_commands(client)
+    if ok:
+        await status_msg.edit_text(
+            "✅ <b>Bot commands successfully synced with Telegram!</b>\n\n"
+            "Registered in both <b>Default</b> and <b>Private Chats</b> scopes.\n\n"
+            "💡 <i>Tip: Telegram apps cache the command menu. If you do not see them immediately in your '/' menu, completely close and reopen your Telegram app.</i>"
+        )
+    else:
+        await status_msg.edit_text("❌ Failed to sync bot commands. Check server console logs for details.")

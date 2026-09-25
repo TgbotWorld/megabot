@@ -45,20 +45,35 @@ app = Client(
 
 async def set_bot_commands(client):
     try:
-        from pyrogram.types import BotCommand
-        await client.set_bot_commands([
-            BotCommand("start", "Start the bot"),
-            BotCommand("agent", "Check AI Agent status"),
-            BotCommand("aiconfig", "Configure AI model, provider & keys"),
-            BotCommand("login", "Connect your MEGA account"),
-            BotCommand("logout", "Disconnect your MEGA account"),
+        from pyrogram.types import (
+            BotCommand,
+            BotCommandScopeDefault,
+            BotCommandScopeAllPrivateChats,
+        )
+        commands = [
+            BotCommand("start", "Start the bot & view features"),
+            BotCommand("agent", "Check AI Agent status & dashboard"),
+            BotCommand("aiconfig", "AI Configuration menu (models, keys, providers)"),
+            BotCommand("setmodel", "Change active AI model"),
+            BotCommand("setprovider", "Change AI provider (gemini, openai, etc.)"),
+            BotCommand("setkey", "Set AI API key (auto-deleted for privacy)"),
+            BotCommand("settemp", "Set AI temperature (0.0 - 2.0)"),
+            BotCommand("settings", "Preferences & conversion options"),
+            BotCommand("cancel", "Cancel current active job"),
             BotCommand("terabox", "Set TeraBox ndus cookie"),
-            BotCommand("settings", "Your preferences"),
-            BotCommand("help", "How to use the bot"),
+            BotCommand("login", "Connect MEGA account"),
+            BotCommand("logout", "Disconnect MEGA account"),
+            BotCommand("help", "Help & command guide"),
             BotCommand("stats", "Bot statistics (owner)"),
-        ])
+        ]
+        # Register for both default scope and all private chats scope
+        await client.set_bot_commands(commands, scope=BotCommandScopeDefault())
+        await client.set_bot_commands(commands, scope=BotCommandScopeAllPrivateChats())
+        logging.info("✅ Successfully registered %d bot commands with Telegram in Default & Private scopes", len(commands))
+        return True
     except Exception as e:
         logging.warning("Setting bot commands skipped: %s", e)
+        return False
 
 
 async def web_server():
