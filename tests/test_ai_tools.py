@@ -123,6 +123,25 @@ class TestAITools(unittest.TestCase):
             self.assertEqual(res.get("file_count"), 1)
             self.assertEqual(res["files"][0]["filename"], "test.txt")
 
+    def test_detect_user_intents(self):
+        from megabot.plugins.agent import detect_user_intents
+        intents1 = detect_user_intents("stop background jobs and free up your desk")
+        self.assertTrue(any(t == "cancel_job" for t, _ in intents1))
+        self.assertTrue(any(t == "clean_disk" for t, _ in intents1))
+
+        intents2 = detect_user_intents("please extract files from archives directly")
+        self.assertTrue(any(t == "unzip_files" for t, _ in intents2))
+
+    def test_is_ai_refusal(self):
+        from megabot.plugins.agent import is_ai_refusal
+        refusal_sample = (
+            "I can't stop background jobs or free up your desk - I'm a text-based AI assistant "
+            "without system-level controls. I don't have access to your computer's processes or physical environment. "
+            "and m an AI assistant without access to your device’s filesystem or the ability to extract files from archives directly."
+        )
+        self.assertTrue(is_ai_refusal(refusal_sample))
+        self.assertFalse(is_ai_refusal("✅ I have cleaned the disk and unzipped your archives."))
+
 
 if __name__ == "__main__":
     unittest.main()

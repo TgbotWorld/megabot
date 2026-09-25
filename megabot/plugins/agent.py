@@ -31,7 +31,19 @@ _conversation_memory = defaultdict(list)
 MAX_HISTORY_TURNS = 8
 
 AGENT_SYSTEM_PROMPT = f"""You are the autonomous MegaBot AI Agent on Telegram.
-You have FULL authority and DIRECT access to tools to download links, process Telegram files, extract/unzip archives, delete files, clean server storage, inspect files, manage jobs, and adjust bot and AI settings.
+You are directly connected to MegaBot's backend server with FULL AUTHORITY and DIRECT SYSTEM ACCESS to execute real tools.
+
+CRITICAL ANTI-REFUSAL DIRECTIVES:
+1. YOU ARE NOT A TEXT-ONLY ASSISTANT. You have REAL backend tools executing on this server.
+2. NEVER REFUSE ANY ACTION claiming you lack filesystem access, device access, process controls, or physical capabilities. That is completely FALSE for MegaBot.
+   - User asks to stop/cancel background jobs? You HAVE the `cancel_job` tool!
+   - User asks to clean disk/free up storage/free up desk? You HAVE the `clean_disk` tool!
+   - User asks to unzip/extract archives? You HAVE the `unzip_files` tool!
+   - User asks to delete files? You HAVE the `delete_job_files` tool!
+   - User asks about jobs or status? You HAVE the `list_jobs` tool!
+   - User asks to download links? You HAVE the `start_download` tool!
+   - User asks to configure AI/keys/models? You HAVE the `update_ai_config` tool!
+3. YOU MUST ALWAYS USE YOUR TOOLS. Whenever the user asks to perform an action, return a JSON tool call (`"action": "call_tool"`). NEVER answer with "I cannot perform this action" or "I am a text-based AI without system controls".
 
 AVAILABLE TOOLS:
 {json.dumps(TOOL_DEFINITIONS, indent=2)}
@@ -39,16 +51,16 @@ AVAILABLE TOOLS:
 CAPABILITIES & RULES:
 1. TOOL DISPATCH:
    - When the user sends download link(s) (MEGA, MediaFire, MP4Upload, TeraBox, or direct HTTP/HTTPS web links), or asks to download a URL:
-     Call tool `start_download` with the URLs and any instructions (e.g., 'unzip archive', 'extract only mp4', 'merge images to pdf', 'delete samples').
-   - When the user asks to change or check AI settings (model, API key, provider, temperature):
+     Call tool `start_download` with the URLs and any instructions.
+   - When the user asks to change or check AI settings (model, API key, provider, temperature, base_url):
      Call tool `update_ai_config` or `get_ai_config`.
    - When the user asks to unzip, decompress, or extract archives (ZIP, RAR, 7Z, TAR, GZ):
      Call tool `unzip_files`.
    - When the user asks to delete job files from server disk:
      Call tool `delete_job_files`.
-   - When the user asks to clean disk or free up storage:
+   - When the user asks to clean disk, free storage, or clean server space:
      Call tool `clean_disk`.
-   - When the user asks to cancel a job:
+   - When the user asks to cancel, stop, or abort background jobs:
      Call tool `cancel_job`.
    - When the user asks about jobs, queue, or history:
      Call tool `list_jobs` or `get_job_details`.
@@ -68,9 +80,9 @@ CAPABILITIES & RULES:
    - You will receive the tool output and can call the next tool or give the final reply.
 
 3. CONVERSATIONAL BEHAVIOR:
-   - If the user greets, chats, asks what you can do, or asks about features:
+   - If the user greets, chats, or asks what you can do:
      Respond warmly and clearly in Telegram HTML format (<b>, <i>, <code>).
-     Explicitly state that you have autonomous tools to download MEGA/MediaFire/MP4Upload/TeraBox and direct web links, process Telegram uploads, unzip archives, convert images to PDF, delete files, and adjust AI config!
+     State that you have direct autonomous tools to download links, extract archives, clean storage, manage background jobs, and adjust settings!
 
 4. RESPONSE FORMAT (Respond with JSON only):
    To execute a tool:
@@ -87,6 +99,96 @@ CAPABILITIES & RULES:
      "response": "<friendly response formatted in Telegram HTML (use <b>, <i>, <code>)>"
    }}
 """
+
+FALLBACK_CONVERSATIONAL_PROMPT = """You are the autonomous MegaBot AI Agent on Telegram.
+MegaBot is a powerful cloud downloader and file processor:
+- Downloads MEGA, MediaFire, MP4Upload, TeraBox, and direct web links at high speed.
+- Receives uploaded Telegram files (documents, videos, audios, photos) and auto-extracts archives.
+- Unzips ZIP, RAR, 7Z, TAR archives, merges images to PDF, generates video thumbnails.
+- Manages background download jobs, cleans disk space, deletes files, and adjusts AI settings (/aiconfig).
+
+Answer the user helpfully and concisely in Telegram HTML (<b>, <i>, <code>).
+NEVER claim you lack system access, device access, or process control. MegaBot is fully equipped with backend tools."""
+
+
+def detect_user_intents(text: str) -> list[tuple[str, dict]]:
+    """Detect tool execution intents directly from user message text."""
+    text_l = text.lower()
+    intents = []
+
+    # Cancel / Stop background jobs
+    if any(k in text_l for k in [
+        "stop background", "cancel background", "stop job", "cancel job",
+        "stop download", "cancel download", "abort job", "stop active", "cancel active"
+    ]):
+        words = text.split()
+        job_id = ""
+        for w in words:
+            if len(w) in [8, 10] and w.isalnum() and not w.isalpha():
+                job_id = w
+                break
+        intents.append(("cancel_job", {"job_id": job_id} if job_id else {}))
+
+    # Clean disk / Free storage / free desk (typo for disk)
+    if any(k in text_l for k in [
+        "clean disk", "free disk", "free storage", "clear storage", "free up storage",
+        "free up disk", "free up your disk", "free up my disk", "free up desk",
+        "free your desk", "free up your desk", "clear disk", "clean server",
+        "free space", "free up space", "clean storage"
+    ]):
+        intents.append(("clean_disk", {}))
+
+    # Unzip / Extract archives
+    if any(k in text_l for k in [
+        "unzip", "extract", "decompress", "unrar", "untar", "extract archive",
+        "extract files", "extract file", "extract archives"
+    ]):
+        intents.append(("unzip_files", {}))
+
+    # Delete job files
+    if any(k in text_l for k in [
+        "delete file", "delete files", "remove file", "remove files", "delete job files", "delete my files"
+    ]):
+        intents.append(("delete_job_files", {}))
+
+    # System / Disk stats
+    if any(k in text_l for k in [
+        "system stats", "server stats", "disk space", "storage stats", "how much disk"
+    ]):
+        intents.append(("get_system_stats", {}))
+
+    # List jobs
+    if any(k in text_l for k in [
+        "show jobs", "list jobs", "my jobs", "active jobs", "queue status", "job status"
+    ]):
+        intents.append(("list_jobs", {}))
+
+    return intents
+
+
+def is_ai_refusal(text: str) -> bool:
+    """Detect if an LLM generated an out-of-context refusal claiming lack of system/file access."""
+    if not text:
+        return False
+    tl = text.lower()
+    refusal_phrases = [
+        "without system-level controls",
+        "text-based ai assistant",
+        "without access to your device",
+        "without access to your computer",
+        "physical environment",
+        "i don't have access to your computer",
+        "i cannot access your filesystem",
+        "without access to the filesystem",
+        "cannot extract files from archives directly",
+        "i don't have the ability to extract files",
+        "i cannot stop background jobs",
+        "cannot stop background jobs",
+        "as an ai, i cannot",
+        "as an ai language model, i do not have access",
+        "don't have access to your computer's processes",
+    ]
+    return any(p in tl for p in refusal_phrases)
 
 
 def _add_memory(user_id: int, role: str, content: str):
@@ -373,6 +475,8 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
     max_steps = 3
     final_reply_text = None
 
+    intents = detect_user_intents(user_text)
+
     for step in range(max_steps):
         try:
             plan = await call_openrouter_json(AGENT_SYSTEM_PROMPT, current_prompt)
@@ -381,7 +485,7 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
             plan = None
 
         if not plan or not isinstance(plan, dict):
-            # Fallback: if links are detected on step 0, ensure download starts!
+            # Fallback 1: if links are detected on step 0, ensure download starts!
             if step == 0 and detected_links:
                 res = await execute_tool("start_download", {"urls": detected_links, "instruction": user_text}, context)
                 if res.get("status") == "success":
@@ -396,11 +500,33 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
                     final_reply_text = f"❌ {res.get('message')}"
                 break
 
-            # Fallback conversational response
+            # Fallback 2: if direct action intents were detected (e.g. stop jobs, clean disk, unzip)
+            if intents:
+                log.info("Executing detected intents fallback for: %s", user_text)
+                results = []
+                for t_name, t_params in intents:
+                    try:
+                        res = await execute_tool(t_name, t_params, context)
+                        results.append(res.get("message", f"{t_name} completed."))
+                    except Exception as te:
+                        results.append(f"{t_name}: {te}")
+                final_reply_text = (
+                    "<blockquote>🛠 <b>Autonomous Action Executed</b></blockquote>\n"
+                    + "\n".join(f"• {r}" for r in results)
+                )
+                break
+
+            # Fallback 3: conversational response with tool-aware prompt
             fb_text = await call_openrouter_text(
-                "You are MegaBot AI Agent. Answer concisely in Telegram HTML.",
+                FALLBACK_CONVERSATIONAL_PROMPT,
                 user_text
             )
+            if is_ai_refusal(fb_text):
+                fb_text = (
+                    "<blockquote>🤖 <b>MegaBot Autonomous AI Agent</b></blockquote>\n"
+                    "I am directly connected to the server and have full tools to process files, extract archives, clean storage, and manage background jobs!\n\n"
+                    "Paste any link (MEGA, MediaFire, MP4Upload, TeraBox), upload a file, or ask me: <i>'clean disk'</i> or <i>'unzip files'</i>."
+                )
             final_reply_text = fb_text or "⚠️ I'm temporarily unable to reach the AI engine. Please try again shortly."
             break
 
@@ -450,8 +576,31 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
 
         else:
             # Action is reply
-            final_reply_text = plan.get("response") or plan.get("summary")
-            break
+            reply_cand = plan.get("response") or plan.get("summary") or ""
+            if is_ai_refusal(reply_cand) and intents:
+                log.info("Detected AI refusal in plan response for action request, executing intents directly...")
+                results = []
+                for t_name, t_params in intents:
+                    try:
+                        res = await execute_tool(t_name, t_params, context)
+                        results.append(res.get("message", f"{t_name} completed."))
+                    except Exception as te:
+                        results.append(f"{t_name}: {te}")
+                final_reply_text = (
+                    "<blockquote>🛠 <b>Autonomous Action Executed</b></blockquote>\n"
+                    + "\n".join(f"• {r}" for r in results)
+                )
+                break
+            elif is_ai_refusal(reply_cand):
+                final_reply_text = (
+                    "<blockquote>🤖 <b>MegaBot Autonomous AI Agent</b></blockquote>\n"
+                    "I am directly connected to the server and have full tools to process files, extract archives, clean storage, and manage background jobs!\n\n"
+                    "💡 <i>Try commands like /cancel, /settings, /aiconfig, or send links or files directly.</i>"
+                )
+                break
+            else:
+                final_reply_text = reply_cand
+                break
 
     if not final_reply_text:
         final_reply_text = "✅ Done."

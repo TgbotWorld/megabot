@@ -211,8 +211,8 @@ async def call_openrouter_json(system_prompt: str, user_prompt: str,
 
 
 def _parse_json_content(raw: str) -> dict | None:
-    """Robust extractor that handles markdown codeblocks, AST, or substring dicts."""
-    clean = raw.strip()
+    """Robust extractor that handles think tags, markdown codeblocks, AST, or substring dicts."""
+    clean = re.sub(r"<think>[\s\S]*?</think>", "", raw or "", flags=re.I).strip()
     if clean.startswith("```json"):
         clean = clean[7:]
     elif clean.startswith("```"):
