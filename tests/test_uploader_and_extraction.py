@@ -125,6 +125,49 @@ class TestUploaderAndExtraction(unittest.TestCase):
         finally:
             loop.close()
 
+    def test_safe_extract_handles_windows_slashes_and_leading_slashes(self):
+        import zipfile
+        zip_path = os.path.join(self.job_dir, "test_slashes.zip")
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("/leading_slash.txt", "content leading")
+            zf.writestr(r"windows\nested\deep.txt", "content windows")
+            zf.writestr("normal.txt", "content normal")
+
+        out_dir = os.path.join(self.job_dir, "extracted")
+        safe_extract(zip_path, out_dir)
+
+        self.assertTrue(os.path.isfile(os.path.join(out_dir, "leading_slash.txt")))
+        self.assertTrue(os.path.isfile(os.path.join(out_dir, "windows", "nested", "deep.txt")))
+        self.assertTrue(os.path.isfile(os.path.join(out_dir, "normal.txt")))
+
+    def test_detect_archive_type_and_is_archive_file_by_magic_bytes(self):
+        import zipfile
+        from megabot.processors.archives import detect_archive_type
+        from megabot.analyzers.classify import is_archive_file
+
+        no_ext_path = os.path.join(self.job_dir, "unnamed_archive")
+        with zipfile.ZipFile(no_ext_path, "w") as zf:
+            zf.writestr("inner.txt", "magic byte test")
+
+        self.assertEqual(detect_archive_type(no_ext_path), ".zip")
+        self.assertTrue(is_archive_file(no_ext_path))
+
+        out_dir = os.path.join(self.job_dir, "magic_extracted")
+        safe_extract(no_ext_path, out_dir)
+        self.assertTrue(os.path.isfile(os.path.join(out_dir, "inner.txt")))
+
+    def test_safe_extract_blocks_zip_slip(self):
+        import zipfile
+        from megabot.processors.archives import UnsafeArchiveError
+
+        slip_zip = os.path.join(self.job_dir, "zip_slip.zip")
+        with zipfile.ZipFile(slip_zip, "w") as zf:
+            zf.writestr("../../../../../etc/passwd", "malicious payload")
+
+        out_dir = os.path.join(self.job_dir, "slip_extracted")
+        with self.assertRaises(UnsafeArchiveError):
+            safe_extract(slip_zip, out_dir)
+
 
 if __name__ == "__main__":
     unittest.main()

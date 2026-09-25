@@ -83,3 +83,92 @@ class TestTelegramMedia(unittest.IsolatedAsyncioTestCase):
 
         app.download_media.assert_called_once()
         mock_upload.assert_called_once()
+
+    @patch("megabot.core.pipeline._upload_files", new_callable=AsyncMock)
+    @patch("megabot.core.pipeline._edit_status", new_callable=AsyncMock)
+    @patch("megabot.core.database.db.set_job_status", new_callable=AsyncMock)
+    @patch("megabot.core.database.db.get_user_setting", new_callable=AsyncMock)
+    async def test_run_job_auto_extracts_telegram_zip_upload(self, mock_setting, mock_status, mock_edit, mock_upload):
+        import zipfile
+        mock_setting.return_value = "extract"  # default user setting
+
+        app = MagicMock()
+        msg_obj = MagicMock()
+        msg_obj.id = 777
+
+        def fake_download_zip(msg, file_name, progress):
+            os.makedirs(os.path.dirname(file_name), exist_ok=True)
+            with zipfile.ZipFile(file_name, "w") as zf:
+                zf.writestr("extracted_file1.txt", "content file 1")
+                zf.writestr("extracted_file2.txt", "content file 2")
+            return file_name
+
+        app.download_media = AsyncMock(side_effect=fake_download_zip)
+
+        job = {
+            "_id": "tg_job_auto_extract",
+            "user_id": 123456,
+            "chat_id": 123456,
+            "message_id": 999,
+            "url": "tg://media/777",
+            "media_message_id": 777,
+            "media_file_name": "my_archive.zip",
+            "media_file_size": 2048,
+            "is_telegram_media": True,
+            "prompt": "",  # Direct upload without caption
+            "_tg_message": msg_obj,
+        }
+
+        with patch("megabot.ai.client.get_ai_config", return_value={"is_configured": False, "api_key": ""}):
+            await run_job(app, job)
+
+        app.download_media.assert_called_once()
+        mock_upload.assert_called_once()
+        uploaded_files = mock_upload.call_args[0][3]
+        file_basenames = [os.path.basename(f) for f in uploaded_files]
+        self.assertIn("extracted_file1.txt", file_basenames)
+        self.assertIn("extracted_file2.txt", file_basenames)
+        self.assertNotIn("my_archive.zip", file_basenames)
+
+    @patch("megabot.core.pipeline._upload_files", new_callable=AsyncMock)
+    @patch("megabot.core.pipeline._edit_status", new_callable=AsyncMock)
+    @patch("megabot.core.database.db.set_job_status", new_callable=AsyncMock)
+    @patch("megabot.core.database.db.get_user_setting", new_callable=AsyncMock)
+    async def test_run_job_respects_keep_archive_prompt(self, mock_setting, mock_status, mock_edit, mock_upload):
+        import zipfile
+        mock_setting.return_value = "extract"
+
+        app = MagicMock()
+        msg_obj = MagicMock()
+        msg_obj.id = 888
+
+        def fake_download_zip(msg, file_name, progress):
+            os.makedirs(os.path.dirname(file_name), exist_ok=True)
+            with zipfile.ZipFile(file_name, "w") as zf:
+                zf.writestr("inner.txt", "content")
+            return file_name
+
+        app.download_media = AsyncMock(side_effect=fake_download_zip)
+
+        job = {
+            "_id": "tg_job_keep_archive",
+            "user_id": 123456,
+            "chat_id": 123456,
+            "message_id": 999,
+            "url": "tg://media/888",
+            "media_message_id": 888,
+            "media_file_name": "bundle.zip",
+            "media_file_size": 2048,
+            "is_telegram_media": True,
+            "prompt": "keep archive as-is",
+            "_tg_message": msg_obj,
+        }
+
+        with patch("megabot.ai.client.get_ai_config", return_value={"is_configured": False, "api_key": ""}):
+            await run_job(app, job)
+
+        mock_upload.assert_called_once()
+        uploaded_files = mock_upload.call_args[0][3]
+        file_basenames = [os.path.basename(f) for f in uploaded_files]
+        self.assertIn("bundle.zip", file_basenames)
+        self.assertNotIn("inner.txt", file_basenames)

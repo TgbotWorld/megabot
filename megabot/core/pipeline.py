@@ -94,7 +94,9 @@ async def run_job(app, job: dict):
             if not media_msg_id and str(urls[0]).startswith("tg://media/"):
                 media_msg_id = int(str(urls[0]).split("/")[-1])
 
-            media_msg = await app.get_messages(job["chat_id"], media_msg_id)
+            media_msg = job.get("_tg_message")
+            if not media_msg:
+                media_msg = await app.get_messages(job["chat_id"], media_msg_id)
             target_path = os.path.join(dest_dir, name)
             await app.download_media(media_msg, file_name=target_path, progress=tg_progress_cb)
 
@@ -188,9 +190,99 @@ async def run_job(app, job: dict):
 
         await db.set_job_status(job_id, "processing")
 
-        # ── 3. AI Processing (if configured) ─────────────────────
+        # ── 3. Content Analysis & Auto-Extraction ────────────────
+        from megabot.analyzers.classify import classify, lone_continuation_volume
+        from megabot.processors.archives import safe_extract
+
+        analysis = await asyncio.to_thread(classify, dest_dir)
+        kind = analysis["kind"]
+
+        # Rescue lone continuation volumes if needed
+        if kind == "archive" and len(analysis["archives"]) == 1 and \
+                lone_continuation_volume(analysis["archives"][0]) and not is_tg_media:
+            lone = analysis["archives"][0]
+            await _edit_status(app, job, texts.status_rescue_search(), cancel_kb(job_id))
+
+            def rescue_cb(d, t, label=""):
+                now = time.time()
+                if now - last_edit["t"] < 3.0:
+                    return
+                last_edit["t"] = now
+                asyncio.run_coroutine_threadsafe(
+                    _edit_status(app, job, texts.progress_rescue(label, d, t),
+                                 cancel_kb(job_id)),
+                    loop,
+                )
+
+            rescued = await asyncio.to_thread(
+                downloader.rescue_siblings, lone, dest_dir, rescue_cb)
+            if rescued:
+                analysis = await asyncio.to_thread(classify, dest_dir)
+                kind = analysis["kind"]
+                await _edit_status(app, job, texts.status_analyzing(name), cancel_kb(job_id))
+            else:
+                log.info("no sibling volumes in account — best-effort extract of %s",
+                         os.path.basename(lone))
+
+        # Check archive extraction intent & user setting
+        mode = await db.get_user_setting(job["user_id"], "archive_mode")
+        u_prompt = (job.get("prompt") or "").lower()
+
+        wants_extract = any(w in u_prompt for w in ["unzip", "extract", "unpack", "decompress"])
+        wants_as_is = any(w in u_prompt for w in ["as is", "as-is", "don't extract", "keep archive", "keep zip"])
+
+        if wants_extract:
+            extract = True
+        elif wants_as_is:
+            extract = False
+        elif mode == "archive":
+            extract = False
+        elif mode == "ask" and analysis["archives"]:
+            await db.set_job_status(job_id, "awaiting_choice")
+            archive_path = analysis["archives"][0]
+            await _edit_status(
+                app, job,
+                texts.archive_choice(name, archive_path),
+                archive_choice_kb(job_id),
+            )
+            return  # resumed from the callback handler
+        else:
+            extract = True  # default: auto unzip archives!
+
+        # Perform auto-extraction if archives are present and extract is requested
+        if extract and analysis["archives"]:
+            out_dir = os.path.join(dest_dir, "extracted")
+            os.makedirs(out_dir, exist_ok=True)
+            await _edit_status(app, job, texts.status_extracting(analysis["name"]), cancel_kb(job_id))
+            extracted_any = False
+            for arc_path in list(analysis["archives"]):
+                try:
+                    await asyncio.to_thread(safe_extract, arc_path, out_dir)
+                    extracted_any = True
+                    try:
+                        os.remove(arc_path)
+                    except Exception:
+                        pass
+                except Exception as ex:
+                    log.warning("Auto-extraction failed on %s: %s", arc_path, ex)
+
+            if extracted_any:
+                inner = await asyncio.to_thread(classify, out_dir)
+                total_extracted = (len(inner["archives"]) + len(inner["videos"]) +
+                                   len(inner["images"]) + len(inner["others"]))
+                if total_extracted > 0:
+                    dest_dir = out_dir
+                    analysis = inner
+                    kind = inner["kind"]
+                    log.info("Auto-extracted archive(s) into %s (%d file(s), kind=%s)",
+                             out_dir, total_extracted, kind)
+                else:
+                    import shutil
+                    shutil.rmtree(out_dir, ignore_errors=True)
+
+        # ── 4. AI Processing (if configured) ─────────────────────
         from megabot.ai.client import get_ai_config
-        ai_cfg = await get_ai_config()
+        ai_cfg = await get_ai_config(job["user_id"])
         ai_files = None
         if ai_cfg.get("api_key"):
             try:
@@ -207,79 +299,10 @@ async def run_job(app, job: dict):
             await _upload_files(app, job, name, ai_files)
             return
 
+        # ── 5. Rule-Based Fallback Upload ────────────────────────
         await _edit_status(app, job, texts.status_analyzing(name), cancel_kb(job_id))
-
-        # ── 4. analyze downloaded content (rule-based fallback) ─
-        from megabot.analyzers.classify import classify
-        analysis = await asyncio.to_thread(classify, dest_dir)
-        kind = analysis["kind"]
-
-        # ── 5. branch on content kind ────────────────────────────
-        if kind == "archive":
-            # lone middle volume of a split set → try to rescue the missing
-            # volumes from the user's own MEGA account before giving up
-            from megabot.analyzers.classify import lone_continuation_volume
-            if len(analysis["archives"]) == 1 and \
-                    lone_continuation_volume(analysis["archives"][0]):
-                lone = analysis["archives"][0]
-                await _edit_status(app, job, texts.status_rescue_search(), cancel_kb(job_id))
-
-                def rescue_cb(d, t, label=""):
-                    now = time.time()
-                    if now - last_edit["t"] < 3.0:
-                        return
-                    last_edit["t"] = now
-                    asyncio.run_coroutine_threadsafe(
-                        _edit_status(app, job, texts.progress_rescue(label, d, t),
-                                     cancel_kb(job_id)),
-                        loop,
-                    )
-
-                rescued = await asyncio.to_thread(
-                    downloader.rescue_siblings, lone, dest_dir, rescue_cb)
-                if rescued:
-                    analysis = await asyncio.to_thread(classify, dest_dir)
-                    kind = analysis["kind"]
-                    await _edit_status(app, job, texts.status_analyzing(name), cancel_kb(job_id))
-                else:
-                    # Don't refuse the job: a lone middle volume usually still
-                    # holds fully readable files (WinRAR opens it for the same
-                    # reason). Continue into the normal archive flow — extraction
-                    # is best-effort now and recovers whatever is inside.
-                    log.info("no sibling volumes in account — best-effort extract of %s",
-                             os.path.basename(lone))
-
-        if kind == "archive":
-            archive_path = analysis["archives"][0]
-            mode = await db.get_user_setting(job["user_id"], "archive_mode")
-            u_prompt = (job.get("prompt") or "").lower()
-
-            wants_extract = any(w in u_prompt for w in ["unzip", "extract", "unpack", "decompress"])
-            wants_as_is = any(w in u_prompt for w in ["as is", "as-is", "don't extract", "keep archive", "keep zip"])
-
-            if wants_extract:
-                extract = True
-            elif wants_as_is:
-                extract = False
-            elif mode == "extract":
-                extract = True
-            elif mode == "archive":
-                extract = False
-            elif mode == "ask":
-                await db.set_job_status(job_id, "awaiting_choice")
-                await _edit_status(
-                    app, job,
-                    texts.archive_choice(name, archive_path),
-                    archive_choice_kb(job_id),
-                )
-                return  # resumed from the callback handler
-            else:
-                extract = True
-        else:
-            extract = False
-
         await db.set_job_status(job_id, "uploading")
-        await _process_and_upload(app, job, dest_dir, analysis, extract_archive=extract)
+        await _process_and_upload(app, job, dest_dir, analysis, extract_archive=False)
 
     finally:
         # Automatically remove downloaded files after job finishes/fails
@@ -304,32 +327,33 @@ async def _process_and_upload(app, job, dest_dir: str, analysis: dict,
     files_to_send: list[str] = []
     pdf_path = None
 
-    if kind == "archive" and extract_archive:
+    if extract_archive and analysis["archives"]:
         import shutil
         from megabot.processors.archives import safe_extract
-        archive_path = analysis["archives"][0]
         out_dir = os.path.join(dest_dir, "extracted")
         os.makedirs(out_dir, exist_ok=True)
         await _edit_status(app, job, texts.status_extracting(analysis["name"]), cancel_kb(job_id))
-        extract_succeeded = False
-        try:
-            await asyncio.to_thread(safe_extract, archive_path, out_dir)
+        extracted_any = False
+        for archive_path in list(analysis["archives"]):
+            try:
+                await asyncio.to_thread(safe_extract, archive_path, out_dir)
+                extracted_any = True
+                try:
+                    os.remove(archive_path)
+                except Exception:
+                    pass
+            except Exception as e:
+                log.warning("extraction failed for %s: %s; keeping original archive", archive_path, e)
+        if extracted_any:
             from megabot.analyzers.classify import classify
             inner = await asyncio.to_thread(classify, out_dir)
             total_extracted = (len(inner["archives"]) + len(inner["videos"]) +
                                len(inner["images"]) + len(inner["others"]))
             if total_extracted > 0:
-                extract_succeeded = True
-                log.info("archive %s extracted → kind=%s, %d file(s)",
-                         archive_path, inner["kind"], total_extracted)
-                # continue processing the EXTRACTED content — replacing kind/analysis entirely.
                 kind, analysis, dest_dir = inner["kind"], inner, out_dir
             else:
-                log.warning("archive %s extraction yielded 0 non-empty files; keeping original archive", archive_path)
+                log.warning("archive extraction yielded 0 non-empty files; keeping original")
                 shutil.rmtree(out_dir, ignore_errors=True)
-        except Exception as e:
-            log.warning("extraction failed for %s: %s; keeping original archive", archive_path, e)
-            shutil.rmtree(out_dir, ignore_errors=True)
 
     if kind == "image_set":
         from megabot.processors.images2pdf import images_to_pdf

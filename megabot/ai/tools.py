@@ -501,13 +501,62 @@ async def execute_tool(tool_name: str, params: dict, context: dict) -> dict:
         elif tool_name == "unzip_files":
             if user_id:
                 await db.set_user_setting(user_id, "archive_mode", "extract")
-            msg = "✅ Automatic archive extraction (unzip) is active for your downloads."
 
+            client = context.get("client")
+            chat_id = context.get("chat_id")
+            message = context.get("message")
+
+            # 1. Did the user reply to a Telegram message with media?
+            if message and message.reply_to_message and client and chat_id:
+                rm = message.reply_to_message
+                file_name = None
+                file_size = 0
+                if rm.document:
+                    file_name = rm.document.file_name or "archive.zip"
+                    file_size = rm.document.file_size or 0
+                elif rm.video:
+                    file_name = rm.video.file_name or "video.mp4"
+                    file_size = rm.video.file_size or 0
+                elif rm.audio:
+                    file_name = rm.audio.file_name or "audio.mp3"
+                    file_size = rm.audio.file_size or 0
+                elif rm.photo:
+                    file_name = "photo.jpg"
+                    file_size = rm.photo.file_size or 0
+
+                if file_name:
+                    new_job_id = uuid.uuid4().hex[:10]
+                    status_card = await client.send_message(
+                        chat_id,
+                        texts.status_queued(f"Telegram file: {file_name}"),
+                        disable_web_page_preview=True
+                    )
+                    new_job = await db.create_job(
+                        new_job_id,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        url=f"tg://media/{rm.id}",
+                        message_id=status_card.id,
+                        prompt="extract archive",
+                    )
+                    new_job["media_message_id"] = rm.id
+                    new_job["media_file_name"] = file_name
+                    new_job["media_file_size"] = file_size
+                    new_job["is_telegram_media"] = True
+                    new_job["_tg_message"] = rm
+                    await job_queue.submit(new_job)
+
+                    return {
+                        "status": "success",
+                        "job_id": new_job_id,
+                        "message": f"🚀 Started extraction for replied file '{file_name}' (Job ID: <code>{new_job_id}</code>). The unzipped files will be delivered shortly."
+                    }
+
+            # 2. Check if a specified or active job folder exists on disk
             job_id = str(params.get("job_id", "")).strip()
-            if not job_id and user_id:
-                # Find latest job with an archive
-                jobs = await db.list_jobs(user_id=user_id, limit=3)
-                for j in jobs:
+            recent_jobs = await db.list_jobs(user_id=user_id, limit=5) if user_id else []
+            if not job_id:
+                for j in recent_jobs:
                     test_dir = os.path.join(DOWNLOAD_DIR, j["_id"])
                     if os.path.isdir(test_dir):
                         job_id = j["_id"]
@@ -517,12 +566,12 @@ async def execute_tool(tool_name: str, params: dict, context: dict) -> dict:
                 job_dir = os.path.join(DOWNLOAD_DIR, job_id)
                 if os.path.isdir(job_dir):
                     from megabot.processors.archives import safe_extract
+                    from megabot.analyzers.classify import is_archive_file
                     extracted_count = 0
                     for root, _, files in os.walk(job_dir):
                         for f in files:
-                            ext = os.path.splitext(f)[1].lower()
-                            if ext in [".zip", ".rar", ".7z", ".tar", ".gz", ".xz", ".bz2"]:
-                                arc_path = os.path.join(root, f)
+                            arc_path = os.path.join(root, f)
+                            if is_archive_file(arc_path):
                                 out = os.path.join(job_dir, "extracted")
                                 try:
                                     safe_extract(arc_path, out)
@@ -544,11 +593,79 @@ async def execute_tool(tool_name: str, params: dict, context: dict) -> dict:
                                     log.warning("Tool unzip failed on %s: %s", arc_path, ee)
                                     shutil.rmtree(out, ignore_errors=True)
                     if extracted_count:
-                        msg += f" Successfully unzipped {extracted_count} archive(s) in job {job_id}."
-                    else:
-                        msg += f" No archive files currently found in workspace for job {job_id}."
+                        return {
+                            "status": "success",
+                            "message": f"✅ Successfully unzipped {extracted_count} archive(s) in active workspace (Job ID: <code>{job_id}</code>)."
+                        }
 
-            return {"status": "success", "message": msg}
+            # 3. If disk was cleaned up, check recent jobs to re-download & extract
+            if recent_jobs and client and chat_id:
+                last_job = recent_jobs[0]
+                if last_job.get("is_telegram_media") or str(last_job.get("url", "")).startswith("tg://media/"):
+                    media_msg_id = last_job.get("media_message_id")
+                    if not media_msg_id and str(last_job.get("url", "")).startswith("tg://media/"):
+                        try:
+                            media_msg_id = int(str(last_job.get("url")).split("/")[-1])
+                        except Exception:
+                            media_msg_id = None
+
+                    file_name = last_job.get("media_file_name", "archive.zip")
+                    new_job_id = uuid.uuid4().hex[:10]
+                    status_card = await client.send_message(
+                        chat_id,
+                        texts.status_queued(f"Telegram file: {file_name}"),
+                        disable_web_page_preview=True
+                    )
+                    new_job = await db.create_job(
+                        new_job_id,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        url=last_job.get("url", f"tg://media/{media_msg_id}"),
+                        message_id=status_card.id,
+                        prompt="extract archive",
+                    )
+                    new_job["media_message_id"] = media_msg_id
+                    new_job["media_file_name"] = file_name
+                    new_job["media_file_size"] = last_job.get("media_file_size", 0)
+                    new_job["is_telegram_media"] = True
+                    await job_queue.submit(new_job)
+
+                    return {
+                        "status": "success",
+                        "job_id": new_job_id,
+                        "message": f"🚀 Re-downloading and extracting '{file_name}' from your recent upload (Job ID: <code>{new_job_id}</code>). Extracted files will be sent shortly."
+                    }
+
+                elif last_job.get("url") and not str(last_job.get("url")).startswith("tg://"):
+                    url = last_job["url"]
+                    new_job_id = uuid.uuid4().hex[:10]
+                    display_url = url if isinstance(url, str) else f"{len(url)} links"
+                    status_card = await client.send_message(
+                        chat_id,
+                        texts.status_queued(display_url),
+                        disable_web_page_preview=True
+                    )
+                    new_job = await db.create_job(
+                        new_job_id,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        url=url,
+                        message_id=status_card.id,
+                        prompt="extract archive",
+                    )
+                    await job_queue.submit(new_job)
+
+                    return {
+                        "status": "success",
+                        "job_id": new_job_id,
+                        "message": f"🚀 Re-queuing download and extraction for '{display_url}' (Job ID: <code>{new_job_id}</code>). Extracted files will be sent shortly."
+                    }
+
+            # 4. Fallback if no recent jobs found
+            return {
+                "status": "success",
+                "message": "✅ <b>Automatic archive extraction is active!</b>\n\nAll zip, rar, 7z, and tar files you upload will now be unzipped automatically. You can also reply directly to any archive file with <i>'unzip'</i> to extract it."
+            }
 
         # ── 12. clear_cache ──────────────────────────────────
         elif tool_name == "clear_cache":

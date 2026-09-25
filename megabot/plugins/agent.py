@@ -144,7 +144,8 @@ def detect_user_intents(text: str) -> list[tuple[str, dict]]:
     # Unzip / Extract archives
     if any(k in text_l for k in [
         "unzip", "extract", "decompress", "unrar", "untar", "extract archive",
-        "extract files", "extract file", "extract archives"
+        "extract files", "extract file", "extract archives", "unzip it", "unzip this",
+        "unzip file", "unzip files", "unpack", "unpack it", "unpack this"
     ]):
         intents.append(("unzip_files", {}))
 
@@ -395,6 +396,7 @@ async def on_user_media(client: Client, message: Message):
     job["media_file_name"] = file_name
     job["media_file_size"] = file_size
     job["is_telegram_media"] = True
+    job["_tg_message"] = message
 
     await job_queue.submit(job)
 
@@ -450,6 +452,7 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
         "is_owner": is_owner,
         "client": client,
         "chat_id": chat_id,
+        "message": message,
     }
 
     ai_cfg = await get_ai_config(user_id)
@@ -496,7 +499,22 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
     if detected_links:
         extra_info += f"\nDetected Download Links: {json.dumps(detected_links)}\n"
 
-    current_prompt = f"User Request: {user_text}{extra_info}{recent_history}"
+    replied_media_info = ""
+    if message.reply_to_message:
+        rm = message.reply_to_message
+        r_fn = None
+        if rm.document:
+            r_fn = rm.document.file_name or "document"
+        elif rm.video:
+            r_fn = rm.video.file_name or "video.mp4"
+        elif rm.audio:
+            r_fn = rm.audio.file_name or "audio.mp3"
+        elif rm.photo:
+            r_fn = "photo.jpg"
+        if r_fn:
+            replied_media_info = f"\nUser replied to Telegram message with file '{r_fn}' (message ID: {rm.id})."
+
+    current_prompt = f"User Request: {user_text}{extra_info}{replied_media_info}{recent_history}"
 
     max_steps = 3
     final_reply_text = None

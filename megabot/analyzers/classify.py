@@ -81,6 +81,30 @@ def _walk_files(root: str) -> list[str]:
     return files
 
 
+def is_archive_file(path: str) -> bool:
+    """Return True if path has an archive extension or archive magic bytes."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in ARCHIVE_EXTS:
+        return True
+    try:
+        if os.path.isfile(path) and os.path.getsize(path) >= 4:
+            with open(path, "rb") as f:
+                hdr = f.read(265)
+            if hdr.startswith((b"PK\x03\x04", b"PK\x05\x06")):
+                return True
+            if hdr.startswith(b"7z\xbc\xaf\x27\x1c"):
+                return True
+            if hdr.startswith(b"Rar!\x1a\x07"):
+                return True
+            if hdr.startswith((b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00")):
+                return True
+            if len(hdr) >= 262 and hdr[257:262] == b"ustar":
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def classify(root: str) -> dict:
     """Classify everything under `root`.
 
@@ -95,7 +119,7 @@ def classify(root: str) -> dict:
 
     images = [f for f in files if os.path.splitext(f)[1].lower() in IMAGE_EXTS]
     videos = [f for f in files if os.path.splitext(f)[1].lower() in VIDEO_EXTS]
-    archives = [f for f in files if os.path.splitext(f)[1].lower() in ARCHIVE_EXTS]
+    archives = [f for f in files if is_archive_file(f)]
     others = [f for f in files if f not in images and f not in videos and f not in archives]
 
     # readable display name: folder name or single file name
@@ -115,6 +139,8 @@ def classify(root: str) -> dict:
     elif len(files) == 1:
         kind = "single"
     elif len(archives) == 1 and not images and not videos and len(others) <= 1:
+        kind = "archive"
+    elif len(archives) >= 1 and not images and not videos and len(others) <= 2:
         kind = "archive"
     elif images and len(images) >= MIN_IMAGES_FOR_PDF and not videos:
         kind = "image_set"

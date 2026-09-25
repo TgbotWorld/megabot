@@ -143,5 +143,58 @@ class TestAITools(unittest.TestCase):
         self.assertFalse(is_ai_refusal("✅ I have cleaned the disk and unzipped your archives."))
 
 
+    @patch("megabot.core.job_queue.job_queue.submit", new_callable=AsyncMock)
+    @patch("megabot.core.database.db.create_job", new_callable=AsyncMock)
+    @patch("megabot.core.database.db.set_user_setting", new_callable=AsyncMock)
+    def test_unzip_files_with_replied_media(self, mock_setting, mock_create, mock_submit):
+        """unzip_files extracts media from replied-to message."""
+        mock_create.return_value = {"_id": "job_unzip_reply"}
+        self.context["client"].send_message = AsyncMock(return_value=MagicMock(id=888))
+
+        msg = MagicMock()
+        replied = MagicMock()
+        replied.id = 456
+        replied.video = None
+        replied.audio = None
+        replied.photo = None
+        doc = MagicMock()
+        doc.file_name = "archive.zip"
+        doc.file_size = 5000
+        replied.document = doc
+        msg.reply_to_message = replied
+        self.context["message"] = msg
+
+        res = asyncio.run(execute_tool("unzip_files", {}, self.context))
+        self.assertEqual(res.get("status"), "success")
+        self.assertIn("job_id", res)
+        self.assertIn("archive.zip", res.get("message"))
+        mock_submit.assert_called_once()
+        mock_setting.assert_called_once_with(99999, "archive_mode", "extract")
+
+    @patch("megabot.core.job_queue.job_queue.submit", new_callable=AsyncMock)
+    @patch("megabot.core.database.db.create_job", new_callable=AsyncMock)
+    @patch("megabot.core.database.db.list_jobs", new_callable=AsyncMock)
+    @patch("megabot.core.database.db.set_user_setting", new_callable=AsyncMock)
+    def test_unzip_files_with_recent_telegram_upload(self, mock_setting, mock_list, mock_create, mock_submit):
+        """unzip_files re-queues recent telegram media upload if no reply message."""
+        mock_list.return_value = [{
+            "_id": "past_job_1",
+            "url": "tg://media/333",
+            "media_message_id": 333,
+            "media_file_name": "past_upload.zip",
+            "media_file_size": 4096,
+            "is_telegram_media": True,
+        }]
+        mock_create.return_value = {"_id": "job_unzip_recent"}
+        self.context["client"].send_message = AsyncMock(return_value=MagicMock(id=999))
+        self.context["message"] = MagicMock(reply_to_message=None)
+
+        res = asyncio.run(execute_tool("unzip_files", {}, self.context))
+        self.assertEqual(res.get("status"), "success")
+        self.assertIn("job_id", res)
+        self.assertIn("past_upload.zip", res.get("message"))
+        mock_submit.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
