@@ -97,9 +97,9 @@ CAPABILITIES & RULES:
    - Chain dependent tools across steps: inspect first (list_jobs, list_job_files, get_job_details), then act.
    - After each tool result, decide: another tool call, or final reply. Never loop the same failing tool twice.
 
-3. SAFETY & CONFIRMATION:
-   - Destructive tools (clean_disk, delete_job_files, cancel_job) require the user to have explicitly asked (e.g. "clean disk", "delete files", "cancel job").
-   - If the request is ambiguous, inspect first with a read-only tool, then ask for confirmation instead of deleting.
+3. DIRECT EXECUTION:
+   - When the user asks for an action once (e.g. "clean disk", "delete files", "cancel job"), execute it immediately. Never ask for confirmation.
+   - If the request is ambiguous, inspect first with a read-only tool, then proceed with the most likely action.
 
 4. CONVERSATIONAL BEHAVIOR:
    - If the user greets, chats, or asks what you can do:
@@ -501,11 +501,8 @@ async def _execute_tool_calls_parallel(tool_calls: list[dict], context: dict,
 
 
 def _needs_explicit_confirmation(tool_name: str, intent_names: set[str]) -> bool:
-    """Destructive tools need an explicit user intent unless they ARE the intent."""
-    meta = get_tool_metadata(tool_name)
-    if not meta.get("requires_confirmation"):
-        return False
-    return tool_name not in intent_names
+    """Confirmation gate removed: a single user request always proceeds."""
+    return False
 
 
 async def _run_agent_turn(client: Client, message: Message, user_text: str):
@@ -619,19 +616,6 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
         if step_res and step_res.get("action") == "call_tools" and step_res.get("tool_calls"):
             tool_calls = step_res["tool_calls"]
             _accumulate(step_res.get("usage", {}))
-
-            # Safety gate for destructive tools without explicit intent
-            gated = [tc for tc in tool_calls
-                     if _needs_explicit_confirmation(tc.get("name", ""), intent_names)]
-            if gated and step == 1:
-                names = ", ".join(f"<code>{tc['name']}</code>" for tc in gated)
-                final_reply_text = (
-                    "<blockquote>⚠️ <b>Confirmation needed</b></blockquote>\n"
-                    f"This will run destructive tool(s): {names}.\n"
-                    "Reply with <b>yes, proceed</b> to confirm, or rephrase to inspect first "
-                    "(e.g. <i>list my jobs</i>)."
-                )
-                break
 
             names_str = ", ".join(f"<code>{tc.get('name')}</code>" for tc in tool_calls[:3])
             try:
@@ -768,12 +752,6 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
                 continue
             for tc in legacy_calls:
                 executed_tools.add(tc.get("name", ""))
-            if any(_needs_explicit_confirmation(tc.get("name", ""), intent_names) for tc in legacy_calls) and step == 1:
-                names = ", ".join(f"<code>{tc['name']}</code>" for tc in legacy_calls)
-                final_reply_text = (
-                    "<blockquote>⚠️ <b>Confirmation needed</b></blockquote>\n"
-                    f"This will run destructive tool(s): {names}.\nReply with <b>yes, proceed</b> to confirm.")
-                break
             results = await _execute_tool_calls_parallel(legacy_calls, context, detected_links, user_text)
             for tc, res in results:
                 if tc.get("name") == "start_download" and res.get("status") == "success":
