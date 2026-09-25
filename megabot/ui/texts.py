@@ -42,7 +42,8 @@ HELP = """<blockquote>{} <b>MegaBot AI Guide</b></blockquote>
 /agent — AI Agent dashboard & status
 /aiconfig — Interactive AI configuration menu
 /setmodel &lt;model&gt; — Change active AI model
-/setprovider &lt;provider&gt; — Switch AI provider
+/setprovider &lt;provider&gt; — Switch preset or set custom provider
+/seturl &lt;base_url&gt; — Set custom OpenAI endpoint URL
 /setkey &lt;key&gt; — Set API key (auto-deleted for privacy)
 /settemp &lt;0.0-2.0&gt; — Set AI temperature
 /settings — Preferences (archive mode, PDF, thumbnails)

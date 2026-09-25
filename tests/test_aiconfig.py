@@ -122,3 +122,52 @@ class TestAIConfig(unittest.IsolatedAsyncioTestCase):
 
         cfg = await get_ai_config()
         self.assertEqual(cfg["temperature"], 0.7)
+
+    async def test_setprovider_custom_url(self):
+        msg = MagicMock()
+        msg.from_user.id = 0
+        msg.command = ["setprovider"]
+        msg.text = "/setprovider https://api.together.xyz/v1"
+        msg.reply_text = AsyncMock()
+
+        with patch("megabot.plugins.aiconfig._is_authorized", return_value=True):
+            await setprovider_cmd(MagicMock(), msg)
+
+        cfg = await get_ai_config()
+        self.assertEqual(cfg["base_url"], "https://api.together.xyz/v1")
+        self.assertEqual(cfg["provider"], "custom")
+
+    async def test_seturl_command(self):
+        msg = MagicMock()
+        msg.from_user.id = 0
+        msg.command = ["seturl"]
+        msg.text = "/seturl https://my-llm.local/v1"
+        msg.reply_text = AsyncMock()
+
+        with patch("megabot.plugins.aiconfig._is_authorized", return_value=True):
+            await setprovider_cmd(MagicMock(), msg)
+
+        cfg = await get_ai_config()
+        self.assertEqual(cfg["base_url"], "https://my-llm.local/v1")
+        self.assertEqual(cfg["provider"], "custom")
+
+    async def test_setprovider_custom_name_and_url(self):
+        msg = MagicMock()
+        msg.from_user.id = 0
+        msg.command = ["setprovider"]
+        msg.text = "/setprovider together https://api.together.xyz/v1"
+        msg.reply_text = AsyncMock()
+
+        with patch("megabot.plugins.aiconfig._is_authorized", return_value=True):
+            await setprovider_cmd(MagicMock(), msg)
+
+        cfg = await get_ai_config()
+        self.assertEqual(cfg["provider"], "together")
+        self.assertEqual(cfg["base_url"], "https://api.together.xyz/v1")
+
+    def test_format_chat_url(self):
+        from megabot.ai.client import format_chat_url
+        self.assertEqual(format_chat_url("https://api.openai.com/v1"), "https://api.openai.com/v1/chat/completions")
+        self.assertEqual(format_chat_url("https://api.openai.com/v1/"), "https://api.openai.com/v1/chat/completions")
+        self.assertEqual(format_chat_url("https://api.openai.com/v1/chat/completions"), "https://api.openai.com/v1/chat/completions")
+        self.assertEqual(format_chat_url("https://api.openai.com/v1/chat/completions/"), "https://api.openai.com/v1/chat/completions")

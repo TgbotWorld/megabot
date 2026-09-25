@@ -633,15 +633,32 @@ async def execute_tool(tool_name: str, params: dict, context: dict) -> dict:
                     return {"status": "error", "message": "Temperature must be a number between 0.0 and 2.0"}
 
             if key == "provider":
-                val = str(val).lower().strip()
-                if val in PROVIDER_PRESETS:
-                    await set_ai_config("provider", val)
-                    await set_ai_config("base_url", PROVIDER_PRESETS[val]["base_url"])
-                    await set_ai_config("model", PROVIDER_PRESETS[val]["default_model"])
+                val_s = str(val).strip()
+                val_l = val_s.lower()
+                if val_l in PROVIDER_PRESETS:
+                    await set_ai_config("provider", val_l)
+                    await set_ai_config("base_url", PROVIDER_PRESETS[val_l]["base_url"])
+                    await set_ai_config("model", PROVIDER_PRESETS[val_l]["default_model"])
                     return {
                         "status": "success",
-                        "message": f"AI provider switched to {PROVIDER_PRESETS[val]['name']}. Default model set to {PROVIDER_PRESETS[val]['default_model']}."
+                        "message": f"AI provider switched to {PROVIDER_PRESETS[val_l]['name']}. Default model set to {PROVIDER_PRESETS[val_l]['default_model']}."
                     }
+                elif val_s.startswith("http://") or val_s.startswith("https://"):
+                    await set_ai_config("provider", "custom")
+                    await set_ai_config("base_url", val_s)
+                    return {
+                        "status": "success",
+                        "message": f"Custom OpenAI-compatible base URL set to {val_s}."
+                    }
+                else:
+                    await set_ai_config("provider", val_s)
+                    return {
+                        "status": "success",
+                        "message": f"AI provider set to '{val_s}'. Configure base_url and model as needed."
+                    }
+
+            if key == "base_url":
+                val = str(val).strip()
 
             await set_ai_config(key, val)
             return {

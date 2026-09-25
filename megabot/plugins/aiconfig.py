@@ -137,38 +137,114 @@ async def setkey_cmd(client: Client, message: Message):
     )
 
 
-@Client.on_message(filters.command("setprovider") & filters.private & filters.incoming & ~filters.bot)
+@Client.on_message(filters.command(["setprovider", "seturl", "setendpoint"]) & filters.private & filters.incoming & ~filters.bot)
 async def setprovider_cmd(client: Client, message: Message):
-    """Switch AI provider: /setprovider <openrouter|gemini|openai|groq|deepseek>"""
+    """Switch AI provider or set custom OpenAI-compatible endpoint URL."""
     user_id = message.from_user.id
     if not _is_authorized(user_id):
         await message.reply_text("🚫 Only the bot owner can change the AI provider.")
         return
 
-    parts = message.text.split(maxsplit=1)
+    cmd = message.command[0].lower()
+    parts = message.text.split(maxsplit=2)
     if len(parts) < 2:
         prov_list = ", ".join(f"<code>{p}</code>" for p in PROVIDER_PRESETS.keys())
         await message.reply_text(
-            f"<b>Usage:</b> <code>/setprovider &lt;provider&gt;</code>\n\n"
-            f"<b>Available providers:</b> {prov_list}"
+            f"<b>Usage:</b>\n"
+            f"• <b>Switch to preset:</b> <code>/setprovider &lt;name&gt;</code> (e.g. {prov_list})\n"
+            f"• <b>Set custom OpenAI URL:</b> <code>/seturl &lt;base_url&gt;</code> (e.g. <code>/seturl https://api.together.xyz/v1</code>)\n"
+            f"• <b>Set Provider & URL:</b> <code>/setprovider &lt;name&gt; &lt;base_url&gt;</code>\n\n"
+            f"<i>You can use ANY OpenAI-compatible API endpoint and model!</i>"
         )
         return
 
-    prov = parts[1].strip().lower()
-    if prov not in PROVIDER_PRESETS:
-        await message.reply_text(f"❌ Unknown provider '{prov}'. Choose from: {', '.join(PROVIDER_PRESETS.keys())}")
+    # If called via /seturl or /setendpoint
+    if cmd in ["seturl", "setendpoint"]:
+        new_url = parts[1].strip()
+        await set_ai_config("provider", "custom")
+        await set_ai_config("base_url", new_url)
+        await message.reply_text(
+            f"✅ <b>Custom OpenAI Endpoint Set!</b>\n"
+            f"• Base URL: <code>{new_url}</code>\n"
+            f"• Provider: <b>Custom OpenAI-Compatible</b>\n\n"
+            f"👉 Set your model: <code>/setmodel &lt;model_id&gt;</code>\n"
+            f"👉 Set your API key: <code>/setkey &lt;key&gt;</code>\n"
+            f"🧪 Test connection with: <code>/aiconfig</code>"
+        )
         return
 
-    pinfo = PROVIDER_PRESETS[prov]
-    await set_ai_config("provider", prov)
-    await set_ai_config("base_url", pinfo["base_url"])
-    await set_ai_config("model", pinfo["default_model"])
+    first_arg = parts[1].strip()
 
+    # Case 1: First argument is already a URL (e.g. /setprovider https://api.together.xyz/v1)
+    if first_arg.startswith("http://") or first_arg.startswith("https://"):
+        await set_ai_config("provider", "custom")
+        await set_ai_config("base_url", first_arg)
+        await message.reply_text(
+            f"✅ <b>Custom OpenAI Endpoint Set!</b>\n"
+            f"• Base URL: <code>{first_arg}</code>\n"
+            f"• Provider: <b>Custom OpenAI-Compatible</b>\n\n"
+            f"👉 Set your model: <code>/setmodel &lt;model_id&gt;</code>\n"
+            f"👉 Set your API key: <code>/setkey &lt;key&gt;</code>"
+        )
+        return
+
+    prov = first_arg.lower()
+
+    # Case 2: Known preset without extra URL
+    if prov in PROVIDER_PRESETS and len(parts) == 2:
+        pinfo = PROVIDER_PRESETS[prov]
+        await set_ai_config("provider", prov)
+        await set_ai_config("base_url", pinfo["base_url"])
+        await set_ai_config("model", pinfo["default_model"])
+        await message.reply_text(
+            f"✅ <b>AI Provider Switched to {pinfo['name']}!</b>\n"
+            f"• Base URL: <code>{pinfo['base_url']}</code>\n"
+            f"• Default Model: <code>{pinfo['default_model']}</code>\n\n"
+            f"<i>Make sure you have set the appropriate API key for {pinfo['name']} with /setkey!</i>"
+        )
+        return
+
+    # Case 3: Custom provider with base URL: /setprovider together https://api.together.xyz/v1
+    if len(parts) >= 3:
+        custom_name = parts[1].strip()
+        custom_url = parts[2].strip()
+        await set_ai_config("provider", custom_name)
+        await set_ai_config("base_url", custom_url)
+        await message.reply_text(
+            f"✅ <b>Custom OpenAI-Compatible Provider Configured!</b>\n"
+            f"• Provider: <b>{custom_name}</b>\n"
+            f"• Base URL: <code>{custom_url}</code>\n\n"
+            f"👉 Set your model: <code>/setmodel &lt;model_id&gt;</code>\n"
+            f"👉 Set your API key: <code>/setkey &lt;key&gt;</code>"
+        )
+        return
+
+    # Case 4: Known extended providers
+    known_urls = {
+        "together": "https://api.together.xyz/v1",
+        "mistral": "https://api.mistral.ai/v1",
+        "perplexity": "https://api.perplexity.ai",
+        "ollama": "http://localhost:11434/v1",
+        "lmstudio": "http://localhost:1234/v1",
+    }
+    if prov in known_urls:
+        await set_ai_config("provider", prov)
+        await set_ai_config("base_url", known_urls[prov])
+        await message.reply_text(
+            f"✅ <b>AI Provider Switched to {prov.title()}!</b>\n"
+            f"• Base URL: <code>{known_urls[prov]}</code>\n\n"
+            f"👉 Set your model: <code>/setmodel &lt;model_id&gt;</code>\n"
+            f"👉 Set your API key: <code>/setkey &lt;key&gt;</code>"
+        )
+        return
+
+    # Case 5: Custom provider name only (e.g. /setprovider custom)
+    await set_ai_config("provider", prov)
     await message.reply_text(
-        f"✅ <b>AI Provider Switched to {pinfo['name']}!</b>\n"
-        f"• Base URL: <code>{pinfo['base_url']}</code>\n"
-        f"• Default Model: <code>{pinfo['default_model']}</code>\n\n"
-        f"<i>Make sure you have set the appropriate API key for {pinfo['name']} with /setkey!</i>"
+        f"✅ Provider set to <b>{prov}</b>.\n\n"
+        f"💡 Please configure the base URL with:\n"
+        f"<code>/seturl &lt;base_url&gt;</code>\n"
+        f"<i>(e.g. <code>/seturl https://api.together.xyz/v1</code>)</i>"
     )
 
 
@@ -252,6 +328,22 @@ async def aiconfig_callbacks(client: Client, cq: CallbackQuery):
             "Select a preset provider (automatically configures default endpoint and model):"
         )
         await cq.message.edit_text(text, reply_markup=ai_providers_kb(cfg["provider"]), disable_web_page_preview=True)
+
+    elif action == "custom_prov":
+        await cq.answer()
+        text = (
+            "<blockquote>🌐 <b>Custom OpenAI-Compatible Provider</b></blockquote>\n"
+            "You can use <b>ANY</b> OpenAI-compatible endpoint or model (Together, Ollama, vLLM, Mistral, Perplexity, or custom server).\n\n"
+            "<b>Setup commands:</b>\n"
+            "• <code>/seturl &lt;base_url&gt;</code> — Set endpoint URL (e.g. <code>https://api.together.xyz/v1</code>)\n"
+            "• <code>/setmodel &lt;model_id&gt;</code> — Set any model name\n"
+            "• <code>/setkey &lt;api_key&gt;</code> — Save your API key\n\n"
+            "<i>Or one-line setup:</i>\n"
+            "<code>/setprovider &lt;name&gt; &lt;base_url&gt;</code>"
+        )
+        from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Providers", callback_data="aiconf:providers")]])
+        await cq.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
 
     elif action.startswith("set_prov:"):
         prov_id = action.split(":", 1)[1]

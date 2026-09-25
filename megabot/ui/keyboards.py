@@ -80,6 +80,7 @@ def ai_providers_kb(current_provider: str) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(label, callback_data=f"aiconf:set_prov:{pid}")])
 
     rows.append([
+        InlineKeyboardButton("✏️ Custom OpenAI Endpoint", callback_data="aiconf:custom_prov"),
         InlineKeyboardButton("🔙 Back", callback_data="aiconf:main"),
     ])
     return InlineKeyboardMarkup(rows)

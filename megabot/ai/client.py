@@ -104,6 +104,8 @@ async def get_ai_config(user_id: Optional[int] = None) -> dict:
         temperature = 0.2
 
     provider_name = PROVIDER_PRESETS.get(provider, {}).get("name", provider.title())
+    if provider == "custom":
+        provider_name = "Custom OpenAI-Compatible"
 
     return {
         "api_key": api_key.strip() if api_key else "",
@@ -114,6 +116,14 @@ async def get_ai_config(user_id: Optional[int] = None) -> dict:
         "temperature": temperature,
         "is_configured": bool(api_key),
     }
+
+
+def format_chat_url(base_url: str) -> str:
+    """Format base URL to ensure proper /chat/completions endpoint without duplicate paths."""
+    clean = (base_url or "https://openrouter.ai/api/v1").strip().rstrip("/")
+    if clean.endswith("/chat/completions"):
+        return clean
+    return f"{clean}/chat/completions"
 
 
 async def set_ai_config(key: str, value: Any) -> None:
@@ -138,7 +148,7 @@ async def call_openrouter_json(system_prompt: str, user_prompt: str,
         log.info("AI API key not configured; AI agent inactive.")
         return None
 
-    url = f"{cfg['base_url']}/chat/completions"
+    url = format_chat_url(cfg["base_url"])
     headers = {
         "Authorization": f"Bearer {cfg['api_key']}",
         "Content-Type": "application/json",
@@ -247,7 +257,7 @@ async def call_openrouter_text(system_prompt: str, user_prompt: str,
         log.info("AI API key not configured; AI agent inactive.")
         return None
 
-    url = f"{cfg['base_url']}/chat/completions"
+    url = format_chat_url(cfg["base_url"])
     headers = {
         "Authorization": f"Bearer {cfg['api_key']}",
         "Content-Type": "application/json",
@@ -298,7 +308,7 @@ async def test_ai_connection(config_override: Optional[dict] = None) -> dict:
             "error": "API Key is not configured.",
         }
 
-    url = f"{cfg['base_url']}/chat/completions"
+    url = format_chat_url(cfg["base_url"])
     headers = {
         "Authorization": f"Bearer {cfg['api_key']}",
         "Content-Type": "application/json",
