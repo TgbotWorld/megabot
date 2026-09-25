@@ -2,7 +2,12 @@
 from typing import Optional
 
 from megabot.downloaders.base import BaseDownloader
-from megabot.downloaders.mega import MegaDownloader, extract_mega_links, link_key as mega_link_key
+from megabot.downloaders.mega import (
+    MegaDownloader,
+    extract_mega_links,
+    is_mega_direct_link,
+    link_key as mega_link_key,
+)
 from megabot.downloaders.mediafire import (
     MediaFireDownloader,
     extract_mediafire_links,
@@ -20,6 +25,12 @@ from megabot.downloaders.terabox import (
     extract_terabox_links,
     is_terabox_link,
     terabox_link_key,
+)
+from megabot.downloaders.direct import (
+    DirectDownloader,
+    extract_direct_links,
+    is_direct_link,
+    direct_link_key,
 )
 
 
@@ -55,6 +66,8 @@ def get_link_key(url: str) -> str:
         return mp4upload_link_key(url)
     if is_mediafire_link(url):
         return mediafire_link_key(url)
+    if is_direct_link(url):
+        return direct_link_key(url)
     return mega_link_key(url)
 
 
@@ -67,6 +80,7 @@ def is_supported_link(url: str) -> bool:
         or is_mp4upload_link(url)
         or is_mediafire_link(url)
         or "mega." in url.lower()
+        or is_mega_direct_link(url)
     )
 
 
@@ -93,6 +107,9 @@ async def get_downloader(url: str, user_id: Optional[int] = None) -> BaseDownloa
 
     if is_mediafire_link(url):
         return MediaFireDownloader()
+
+    if is_direct_link(url):
+        return DirectDownloader()
 
     # Default to MEGA with user session credentials
     from megabot.core.database import db

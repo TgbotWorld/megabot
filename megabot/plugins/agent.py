@@ -4,22 +4,24 @@ from collections import defaultdict
 import json
 import logging
 import time
+import uuid
 
 from pyrogram import Client, filters
 from pyrogram.enums import ChatAction
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
-from config import (
-    OPENROUTER_API_KEY,
-    OPENROUTER_MODEL,
-    OPENROUTER_BASE_URL,
-    OWNER_ID,
-    MAX_JOBS_PER_USER,
+from config import OWNER_ID, MAX_JOBS_PER_USER, MAX_FILE_SIZE_MB
+from megabot.ai.client import (
+    call_openrouter_text,
+    call_openrouter_json,
+    get_ai_config,
+    test_ai_connection,
 )
-from megabot.ai.client import call_openrouter_text, call_openrouter_json
 from megabot.ai.tools import TOOL_DEFINITIONS, execute_tool
 from megabot.core.database import db
+from megabot.core.job_queue import job_queue
 from megabot.downloaders import extract_supported_links, is_supported_link
+from megabot.processors.uploader import human_size
 from megabot.ui import texts
 
 log = logging.getLogger(__name__)
@@ -29,15 +31,17 @@ _conversation_memory = defaultdict(list)
 MAX_HISTORY_TURNS = 8
 
 AGENT_SYSTEM_PROMPT = f"""You are the autonomous MegaBot AI Agent on Telegram.
-You have FULL authority and DIRECT access to tools to download links, extract/unzip archives, delete files, clean server storage, inspect files, manage jobs, and adjust settings.
+You have FULL authority and DIRECT access to tools to download links, process Telegram files, extract/unzip archives, delete files, clean server storage, inspect files, manage jobs, and adjust bot and AI settings.
 
 AVAILABLE TOOLS:
 {json.dumps(TOOL_DEFINITIONS, indent=2)}
 
 CAPABILITIES & RULES:
 1. TOOL DISPATCH:
-   - When the user sends MEGA (mega.nz), MediaFire (mediafire.com), MP4Upload (mp4upload.com), or TeraBox (terabox.com/1024tera.com) link(s), or asks to download a URL:
+   - When the user sends download link(s) (MEGA, MediaFire, MP4Upload, TeraBox, or direct HTTP/HTTPS web links), or asks to download a URL:
      Call tool `start_download` with the URLs and any instructions (e.g., 'unzip archive', 'extract only mp4', 'merge images to pdf', 'delete samples').
+   - When the user asks to change or check AI settings (model, API key, provider, temperature):
+     Call tool `update_ai_config` or `get_ai_config`.
    - When the user asks to unzip, decompress, or extract archives (ZIP, RAR, 7Z, TAR, GZ):
      Call tool `unzip_files`.
    - When the user asks to delete job files from server disk:
@@ -52,7 +56,7 @@ CAPABILITIES & RULES:
      Call tool `list_job_files`.
    - When the user asks about disk space or server statistics:
      Call tool `get_system_stats`.
-   - When the user asks to change settings (archive mode, PDF merging, video thumbs):
+   - When the user asks to change user settings (archive mode, PDF merging, video thumbs):
      Call tool `update_user_setting`.
    - When the user asks to set or update TeraBox session cookie:
      Call tool `set_terabox_cookie`.
@@ -65,8 +69,8 @@ CAPABILITIES & RULES:
 
 3. CONVERSATIONAL BEHAVIOR:
    - If the user greets, chats, asks what you can do, or asks about features:
-     Respond warmly and clearly in Telegram HTML format (<b>, <i>, <code>, <b>).
-     Explicitly state that you have autonomous tools to download MEGA/MediaFire/MP4Upload/TeraBox links, unzip archives, convert images to PDF, delete files, and manage disk space!
+     Respond warmly and clearly in Telegram HTML format (<b>, <i>, <code>).
+     Explicitly state that you have autonomous tools to download MEGA/MediaFire/MP4Upload/TeraBox and direct web links, process Telegram uploads, unzip archives, convert images to PDF, delete files, and adjust AI config!
 
 4. RESPONSE FORMAT (Respond with JSON only):
    To execute a tool:
@@ -80,7 +84,7 @@ CAPABILITIES & RULES:
    To reply directly to the user:
    {{
      "action": "reply",
-     "response": "<friendly response formatted in Telegram HTML (use <b>, <i>, <code>, <b>)>"
+     "response": "<friendly response formatted in Telegram HTML (use <b>, <i>, <code>)>"
    }}
 """
 
@@ -110,43 +114,61 @@ async def agent_command(client: Client, message: Message):
 
     # If no query, show interactive agent dashboard
     status_msg = await message.reply_text("🤖 <i>Connecting to AI Agent…</i>")
-    start = time.time()
+    user_id = message.from_user.id
+    cfg = await get_ai_config(user_id)
 
-    provider_name = "OrcaRouter" if "orcarouter" in OPENROUTER_BASE_URL.lower() else "OpenRouter"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚙️ Configure AI Settings", callback_data="aiconf:main")],
+        [InlineKeyboardButton("🧪 Test Connection", callback_data="aiconf:test")],
+    ])
 
-    try:
-        resp = await call_openrouter_json(
-            'You are a health check assistant. Respond with JSON only: {"status": "ok"}',
-            "ping",
-        )
-        latency = int((time.time() - start) * 1000)
-
+    if not cfg["is_configured"]:
         text = (
             "<blockquote>🤖 <b>MegaBot Autonomous AI Agent</b></blockquote>\n"
-            f"• <b>Status:</b> Online & Ready ✅\n"
-            f"• <b>Provider:</b> {provider_name}\n"
-            f"• <b>Model:</b> <code>{OPENROUTER_MODEL}</code>\n"
+            "• <b>Status:</b> Inactive (API Key needed) ⚠️\n"
+            f"• <b>Provider:</b> {cfg['provider_name']}\n"
+            f"• <b>Configured Model:</b> <code>{cfg['model']}</code>\n\n"
+            "💡 <i>To activate conversational AI and smart dispatch:</i>\n"
+            "• Tap <b>Configure AI Settings</b> below or send <code>/setkey &lt;your-key&gt;</code>\n"
+            "• Downloads, unzipping, and Telegram file processing still run automatically!"
+        )
+        await status_msg.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+        return
+
+    # Test live connection
+    conn = await test_ai_connection(cfg)
+    latency = conn.get("latency_ms", 0)
+
+    if conn.get("success"):
+        text = (
+            "<blockquote>🤖 <b>MegaBot Autonomous AI Agent</b></blockquote>\n"
+            "• <b>Status:</b> Online & Ready ✅\n"
+            f"• <b>Provider:</b> {cfg['provider_name']}\n"
+            f"• <b>Model:</b> <code>{cfg['model']}</code>\n"
             f"• <b>Latency:</b> <code>{latency} ms</code>\n"
             "• <b>Privacy:</b> 🛡️ <i>Zero file content inspection</i>\n"
             "• <b>Sandbox:</b> 🔒 <i>Enforced job directory jail</i>\n\n"
             "🛠 <b>Autonomous Tools & Capabilities:</b>\n"
-            "• 📥 <b>Downloads:</b> MEGA.nz, MediaFire, MP4Upload, and TeraBox\n"
+            "• 📥 <b>Downloads:</b> MEGA, MediaFire, MP4Upload, TeraBox & Direct Web URLs\n"
+            "• 📁 <b>Telegram Files:</b> Direct file/document uploads & automatic processing\n"
             "• 📦 <b>Unzip:</b> Extract ZIP, RAR, 7Z, TAR archives automatically\n"
             "• 🖼️ <b>PDF:</b> Merge image sets into single ordered PDFs\n"
             "• 🗑️ <b>Files:</b> Delete job files & auto-clean server disk\n"
             "• 📋 <b>Jobs:</b> List, inspect, track, and cancel active jobs\n"
-            "• ⚙️ <b>Settings:</b> Manage extraction modes & video thumbnails\n\n"
+            "• ⚙️ <b>AI Config:</b> Switch models, keys, and providers right from Telegram!\n\n"
             "💬 <b>Chat with me directly:</b>\n"
-            "Send any message, paste download links, or ask me to perform tasks!"
+            "Send any message, paste links, send files, or ask me to perform tasks!"
         )
-    except Exception as e:
+    else:
         text = (
             "<blockquote>⚠️ <b>AI Agent: Connection Warning</b></blockquote>\n"
-            f"Could not contact AI provider: <code>{e}</code>\n"
-            "<i>Downloads are still processed with built-in auto-extraction.</i>"
+            f"Could not contact AI provider: <code>{conn.get('error')}</code>\n"
+            f"• <b>Provider:</b> {cfg['provider_name']}\n"
+            f"• <b>Model:</b> <code>{cfg['model']}</code>\n\n"
+            "<i>Tap Configure AI Settings to change provider, model, or API key.</i>"
         )
 
-    await status_msg.edit_text(text, disable_web_page_preview=True)
+    await status_msg.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
 
 
 @Client.on_message(filters.command("cancel") & filters.private & filters.incoming & ~filters.bot)
@@ -170,6 +192,89 @@ async def cancel_command(client: Client, message: Message):
         await message.reply_text(f"<blockquote>⚠️ <b>Cancel Failed</b></blockquote>\n{res.get('message')}")
 
 
+# ── Incoming Telegram Files & Media Handler ─────────────────────
+
+@Client.on_message(
+    filters.private
+    & filters.incoming
+    & ~filters.bot
+    & ~filters.service
+    & (filters.document | filters.video | filters.audio | filters.photo)
+)
+async def on_user_media(client: Client, message: Message):
+    """
+    Handle direct Telegram file uploads (documents, archives, videos, audios, photos).
+    Enqueues the media for downloading and pipeline processing (unzip, PDF merge, thumbs, etc.).
+    """
+    if not message.from_user or message.from_user.is_bot:
+        return
+
+    user_id = message.from_user.id
+    await db.add_user(user_id, message.from_user.username)
+
+    if await db.is_user_banned(user_id):
+        await message.reply_text(texts.BANNED)
+        return
+
+    # Check active jobs limit
+    active = await db.active_jobs_for_user(user_id)
+    if active >= MAX_JOBS_PER_USER:
+        await message.reply_text(
+            f"⏳ You already have {active} active job(s). Maximum allowed is {MAX_JOBS_PER_USER}. "
+            "Please wait for your current job to finish."
+        )
+        return
+
+    # Extract file attributes
+    file_name = "telegram_file"
+    file_size = 0
+
+    if message.document:
+        file_name = message.document.file_name or "document"
+        file_size = message.document.file_size or 0
+    elif message.video:
+        file_name = message.video.file_name or f"video_{message.id}.mp4"
+        file_size = message.video.file_size or 0
+    elif message.audio:
+        file_name = message.audio.file_name or f"audio_{message.id}.mp3"
+        file_size = message.audio.file_size or 0
+    elif message.photo:
+        file_name = f"photo_{message.id}.jpg"
+        file_size = message.photo.file_size or 0
+
+    # Check file size limit
+    if file_size and file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
+        await message.reply_text(texts.error_too_large(file_name, file_size))
+        return
+
+    instruction = (message.caption or "").strip()
+    job_id = uuid.uuid4().hex[:10]
+
+    # Create live status card
+    status_card = await message.reply_text(
+        texts.status_queued(f"Telegram file: {file_name}"),
+        disable_web_page_preview=True
+    )
+
+    # Register job in MongoDB
+    job = await db.create_job(
+        job_id,
+        user_id=user_id,
+        chat_id=message.chat.id,
+        url=f"tg://media/{message.id}",
+        message_id=status_card.id,
+        prompt=instruction,
+    )
+    job["media_message_id"] = message.id
+    job["media_file_name"] = file_name
+    job["media_file_size"] = file_size
+    job["is_telegram_media"] = True
+
+    await job_queue.submit(job)
+
+    log.info("Queued Telegram media download job %s for %s (%s)", job_id, file_name, human_size(file_size))
+
+
 @Client.on_message(
     filters.private
     & filters.incoming
@@ -179,11 +284,12 @@ async def cancel_command(client: Client, message: Message):
     & ~filters.command([
         "start", "help", "settings", "stats", "ban", "unban",
         "broadcast", "login", "logout", "cancel", "agent", "ai",
-        "terabox", "cookie"
+        "terabox", "cookie", "aiconfig", "aiconf", "setmodel",
+        "setkey", "setprovider", "settemp"
     ])
 )
 async def on_user_message(client: Client, message: Message):
-    """Primary entry point for ALL user messages (text, questions, links, requests)."""
+    """Primary entry point for ALL user text messages (links, questions, requests)."""
     if not message.from_user or message.from_user.is_bot or message.from_user.is_self:
         return
 
@@ -219,23 +325,29 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
         "chat_id": chat_id,
     }
 
-    # If OpenRouter is not configured:
-    if not OPENROUTER_API_KEY:
+    ai_cfg = await get_ai_config(user_id)
+
+    # If AI API key is not configured:
+    if not ai_cfg["is_configured"]:
         if detected_links:
             res = await execute_tool("start_download", {"urls": detected_links, "instruction": user_text}, context)
             if res.get("status") == "success":
                 await message.reply_text(
                     f"🚀 <b>Download Queued!</b>\nJob ID: <code>{res.get('job_id')}</code>\n"
-                    "<i>(Configure OPENROUTER_API_KEY to activate full AI conversational capabilities.)</i>"
+                    "<i>(Set an AI API key using /aiconfig or /setkey to activate full conversational brain.)</i>"
                 )
             else:
                 await message.reply_text(f"❌ {res.get('message')}")
             return
         else:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("⚙️ Configure AI Key", callback_data="aiconf:main")
+            ]])
             await message.reply_text(
                 "<blockquote>🤖 <b>MegaBot AI Agent</b></blockquote>\n"
-                "To chat with the AI Agent and use autonomous tools, set <code>OPENROUTER_API_KEY</code> in your <code>.env</code> file.\n\n"
-                "You can still download MEGA, MediaFire, MP4Upload, and TeraBox links by pasting them here!",
+                "To chat with the AI Agent and use autonomous tools, set your API key using <code>/setkey &lt;key&gt;</code> or open <code>/aiconfig</code>.\n\n"
+                "You can still download MEGA, MediaFire, MP4Upload, TeraBox, or direct web links by pasting them here, or send files directly to extract them!",
+                reply_markup=kb,
                 disable_web_page_preview=True,
             )
             return
@@ -265,7 +377,7 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
         try:
             plan = await call_openrouter_json(AGENT_SYSTEM_PROMPT, current_prompt)
         except Exception as e:
-            log.warning("OpenRouter call failed in step %d: %s", step, e)
+            log.warning("AI call failed in step %d: %s", step, e)
             plan = None
 
         if not plan or not isinstance(plan, dict):

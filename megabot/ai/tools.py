@@ -18,11 +18,29 @@ log = logging.getLogger(__name__)
 TOOL_DEFINITIONS = [
     {
         "name": "start_download",
-        "description": "Download one or more files/folders from MEGA, MediaFire, MP4Upload, or TeraBox. Automatically queues and tracks the download with optional custom instructions (e.g., unzip archives, merge images into PDF, filter files, keep archive).",
+        "description": "Download one or more files/folders from MEGA, MediaFire, MP4Upload, TeraBox, or direct HTTP/HTTPS web links. Automatically queues and tracks the download with optional custom instructions (e.g., unzip archives, merge images into PDF, filter files, keep archive).",
         "parameters": {
-            "urls": "A list of MEGA, MediaFire, MP4Upload, or TeraBox URL strings, or a single URL string (required).",
+            "urls": "A list of URLs or single URL (MEGA, MediaFire, MP4Upload, TeraBox, or direct HTTP/HTTPS link) (required).",
             "instruction": "Optional instructions for what to do with the files (e.g. 'unzip archive', 'extract only videos', 'convert images to pdf', 'delete samples')."
         }
+    },
+    {
+        "name": "get_ai_config",
+        "description": "Check current AI configuration: provider, active model, base URL, temperature, and status.",
+        "parameters": {}
+    },
+    {
+        "name": "update_ai_config",
+        "description": "Update AI configuration settings directly from Telegram. Can update model, api_key, provider, base_url, or temperature.",
+        "parameters": {
+            "key": "The setting to change: 'model', 'api_key', 'provider', 'base_url', or 'temperature' (required).",
+            "value": "The new value for the setting (e.g., 'google/gemini-2.0-flash', 'openai/gpt-4o-mini', 'deepseek/deepseek-chat', '0.2', or API key string) (required)."
+        }
+    },
+    {
+        "name": "test_ai_connection",
+        "description": "Test live connection to the configured AI provider, measuring response latency and health.",
+        "parameters": {}
     },
     {
         "name": "list_jobs",
@@ -580,6 +598,64 @@ async def execute_tool(tool_name: str, params: dict, context: dict) -> dict:
                 "account": uname,
                 "message": f"TeraBox session cookie successfully saved in MongoDB. Scope: {scope_str}. Account: {uname}. Status: {valid_note}.",
             }
+
+        # ── 16. get_ai_config ────────────────────────────────
+        elif tool_name == "get_ai_config":
+            from megabot.ai.client import get_ai_config
+            cfg = await get_ai_config(user_id)
+            masked_key = (cfg["api_key"][:6] + "..." + cfg["api_key"][-4:]) if cfg["api_key"] else "Not configured"
+            return {
+                "status": "success",
+                "provider": cfg["provider_name"],
+                "model": cfg["model"],
+                "base_url": cfg["base_url"],
+                "temperature": cfg["temperature"],
+                "api_key_status": masked_key,
+                "is_active": cfg["is_configured"],
+            }
+
+        # ── 17. update_ai_config ─────────────────────────────
+        elif tool_name == "update_ai_config":
+            key = str(params.get("key", "")).strip().lower()
+            val = params.get("value")
+            if not key or val is None:
+                return {"status": "error", "message": "Both 'key' and 'value' parameters are required."}
+
+            allowed_keys = ["model", "api_key", "provider", "base_url", "temperature"]
+            if key not in allowed_keys:
+                return {"status": "error", "message": f"Invalid key '{key}'. Allowed keys: {', '.join(allowed_keys)}"}
+
+            from megabot.ai.client import set_ai_config, PROVIDER_PRESETS
+            if key == "temperature":
+                try:
+                    val = float(val)
+                except ValueError:
+                    return {"status": "error", "message": "Temperature must be a number between 0.0 and 2.0"}
+
+            if key == "provider":
+                val = str(val).lower().strip()
+                if val in PROVIDER_PRESETS:
+                    await set_ai_config("provider", val)
+                    await set_ai_config("base_url", PROVIDER_PRESETS[val]["base_url"])
+                    await set_ai_config("model", PROVIDER_PRESETS[val]["default_model"])
+                    return {
+                        "status": "success",
+                        "message": f"AI provider switched to {PROVIDER_PRESETS[val]['name']}. Default model set to {PROVIDER_PRESETS[val]['default_model']}."
+                    }
+
+            await set_ai_config(key, val)
+            return {
+                "status": "success",
+                "key": key,
+                "value": "******" if key == "api_key" else val,
+                "message": f"Successfully updated AI setting '{key}' to {val if key != 'api_key' else '[hidden]'}."
+            }
+
+        # ── 18. test_ai_connection ───────────────────────────
+        elif tool_name == "test_ai_connection":
+            from megabot.ai.client import test_ai_connection
+            res = await test_ai_connection()
+            return res
 
         else:
             return {"status": "error", "message": f"Unknown tool: '{tool_name}'"}

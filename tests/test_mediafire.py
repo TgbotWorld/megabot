@@ -144,6 +144,59 @@ class TestMediaFireDownloader(unittest.TestCase):
             self.assertEqual(f.read(), content_data)
         self.assertTrue(len(progress_calls) > 0)
 
+    def test_direct_mediafire_link_detection(self):
+        direct_url = "https://download1500.mediafire.com/xyz123/sample_archive.zip"
+        self.assertTrue(is_mediafire_link(direct_url))
+        self.assertTrue(is_supported_link(direct_url))
+        extracted = extract_mediafire_links(f"Download here: {direct_url}")
+        self.assertIn(direct_url, extracted)
+
+    @patch("requests.Session.head")
+    def test_probe_direct_mediafire_file(self, mock_head):
+        downloader = MediaFireDownloader()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {
+            "content-disposition": 'attachment; filename="archive.zip"',
+            "content-length": "2097152",
+        }
+        mock_head.return_value = mock_resp
+
+        direct_url = "https://download1234.mediafire.com/token/archive.zip"
+        info = downloader.probe(direct_url)
+        self.assertEqual(info["name"], "archive.zip")
+        self.assertEqual(info["size"], 2097152)
+        self.assertEqual(info["kind"], "file")
+        self.assertEqual(info["direct_url"], direct_url)
+
+    @patch("requests.Session.head")
+    @patch("requests.Session.get")
+    def test_download_direct_mediafire_file(self, mock_get, mock_head):
+        downloader = MediaFireDownloader()
+        mock_resp_head = MagicMock()
+        mock_resp_head.status_code = 200
+        mock_resp_head.headers = {
+            "content-disposition": 'attachment; filename="direct_file.bin"',
+            "content-length": "10",
+        }
+        mock_head.return_value = mock_resp_head
+
+        content_data = b"0123456789"
+        stream_resp = MagicMock()
+        stream_resp.status_code = 200
+        stream_resp.headers = {"content-length": "10"}
+        stream_resp.__enter__.return_value = stream_resp
+        stream_resp.__exit__.return_value = False
+        stream_resp.iter_content.return_value = [content_data]
+        mock_get.return_value = stream_resp
+
+        direct_url = "https://download999.mediafire.com/tok/direct_file.bin"
+        out = downloader.download(direct_url, self.temp_dir)
+        self.assertTrue(os.path.exists(out))
+        self.assertEqual(os.path.basename(out), "direct_file.bin")
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), content_data)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -49,6 +49,7 @@ async def set_bot_commands(client):
         await client.set_bot_commands([
             BotCommand("start", "Start the bot"),
             BotCommand("agent", "Check AI Agent status"),
+            BotCommand("aiconfig", "Configure AI model, provider & keys"),
             BotCommand("login", "Connect your MEGA account"),
             BotCommand("logout", "Disconnect your MEGA account"),
             BotCommand("terabox", "Set TeraBox ndus cookie"),
@@ -96,12 +97,13 @@ async def check_database():
 
 
 async def check_ai():
-    """Log OpenRouter AI Agent status on startup."""
-    from config import OPENROUTER_API_KEY, OPENROUTER_MODEL
-    if not OPENROUTER_API_KEY:
-        logging.warning("🤖 AI Agent: Inactive (Set OPENROUTER_API_KEY in .env to activate)")
+    """Log AI Agent status on startup."""
+    from megabot.ai.client import get_ai_config
+    cfg = await get_ai_config()
+    if not cfg["is_configured"]:
+        logging.warning("🤖 AI Agent: Inactive (Set OPENROUTER_API_KEY in .env or via /setkey or /aiconfig in Telegram)")
         return
-    logging.info("🤖 AI Agent: Active (Model: %s, Privacy & Sandbox Enforced)", OPENROUTER_MODEL)
+    logging.info("🤖 AI Agent: Active (Provider: %s, Model: %s, Privacy & Sandbox Enforced)", cfg["provider_name"], cfg["model"])
 
 
 async def main():

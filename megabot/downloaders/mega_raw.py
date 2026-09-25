@@ -27,9 +27,9 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
 FOLDER_URL_RE = re.compile(
-    r"https?://mega\.(?:nz|io|co\.nz)/folder/([\w\-]+)#([\w\-]+)", re.I)
+    r"https?://mega\.(?:nz|io|co\.nz)/(?:folder/([\w\-]+)#([\w\-]+)|#F!([\w\-]+)!([\w\-]+))", re.I)
 FILE_URL_RE = re.compile(
-    r"https?://mega\.(?:nz|io|co\.nz)/file/([\w\-]+)#([\w\-]+)", re.I)
+    r"https?://mega\.(?:nz|io|co\.nz)/(?:file/([\w\-]+)#([\w\-]+)|#!([\w\-]+)!([\w\-]+))", re.I)
 
 
 class RawMega:
@@ -111,19 +111,47 @@ class RawMega:
     @staticmethod
     def parse_folder_url(url: str):
         m = FOLDER_URL_RE.search(url or "")
-        return (m.group(1), m.group(2)) if m else None
+        if not m:
+            return None
+        groups = [g for g in m.groups() if g is not None]
+        return (groups[0], groups[1]) if len(groups) >= 2 else None
 
     @staticmethod
     def parse_file_url(url: str):
         m = FILE_URL_RE.search(url or "")
-        return (m.group(1), m.group(2)) if m else None
+        if not m:
+            return None
+        groups = [g for g in m.groups() if g is not None]
+        return (groups[0], groups[1]) if len(groups) >= 2 else None
 
     def probe_file(self, url: str) -> dict:
-        info = self._m.get_public_url_info(url)
-        if not info:
-            raise RequestError(f"MEGA node not found for {url}")
-        return {"name": info.get("name", "mega-file"),
-                "size": int(info.get("size") or 0), "kind": "file"}
+        parsed = self.parse_file_url(url)
+        if not parsed:
+            raise ValueError(f"Not a MEGA file link: {url}")
+        handle, key_b64 = parsed
+        key = base64_to_a32(key_b64)
+
+        req = {"a": "g", "g": 1, "ssm": 1, "p": handle}
+        try:
+            data = self._api(req)
+        except RequestError as e:
+            if e.args and e.args[0] in (-9, -13, -14):
+                data = self._api(req, anon=True)
+            else:
+                raise
+
+        name = handle
+        try:
+            k_probe = (key[0] ^ key[4], key[1] ^ key[5],
+                       key[2] ^ key[6], key[3] ^ key[7])
+            attr = decrypt_attr(base64_url_decode(data.get("at", "")), k_probe)
+            if attr and attr.get("n"):
+                name = attr["n"]
+        except Exception:
+            pass
+
+        size = int(data.get("s") or 0)
+        return {"name": name, "size": size, "kind": "file"}
 
     def download_file(self, url: str, dest_dir: str, progress_cb=None) -> str:
         """Download a public file link straight into dest_dir.

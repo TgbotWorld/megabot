@@ -15,19 +15,41 @@ from megabot.downloaders.mega_raw import RawMega
 log = logging.getLogger(__name__)
 
 MEGA_URL_RE = re.compile(
-    r"https?://mega\.(?:nz|io|co\.nz)/(?:file|folder)/[\w#!\-]+", re.I
+    r"https?://(?:[a-zA-Z0-9\-._]+\.)?mega\.(?:nz|io|co\.nz)/(?:(?:file|folder)/[\w\-]+#[\w\-]+|#(?:F!)?[\w\-]+![\w\-]+|[^\s\"\'<>]+)|https?://[a-zA-Z0-9\-._]+\.usercontent\.mega\.co\.nz/[^\s\"\'<>]+",
+    re.I
 )
+
+
+def is_mega_direct_link(url: str) -> bool:
+    """Check if URL is a direct MEGA storage/download link rather than an encrypted handle link."""
+    if not url:
+        return False
+    url_l = url.lower()
+    return bool(
+        "usercontent.mega.co.nz" in url_l
+        or "usercontent.mega.nz" in url_l
+        or re.search(r"https?://gfs\d*\.mega\.(?:nz|io|co\.nz)/", url_l)
+        or ("/direct/" in url_l and "mega." in url_l)
+    )
 
 
 def extract_mega_links(text: str) -> list[str]:
     """Pull all MEGA file/folder links out of arbitrary text."""
-    return list(dict.fromkeys(MEGA_URL_RE.findall(text or "")))
+    if not text:
+        return []
+    matches = MEGA_URL_RE.findall(text)
+    cleaned = [m.rstrip(".,;:!?)'\"") for m in matches]
+    return list(dict.fromkeys(cleaned))
 
 
 def link_key(url: str) -> str:
     """Stable identifier for a MEGA link (for the dedup cache)."""
-    m = re.search(r"/(file|folder)/([\w#!\-]+)", url)
-    return m.group(2) if m else url
+    m = re.search(r"/(?:file/|folder/|#F!|#!)([\w\-]+)", url)
+    if m:
+        return m.group(1)
+    import hashlib
+    h = hashlib.sha256(url.encode()).hexdigest()[:12]
+    return f"mega_dir_{h}"
 
 
 class MegaDownloader(BaseDownloader):
@@ -37,6 +59,8 @@ class MegaDownloader(BaseDownloader):
         self._saved_session = saved_session
         self.session_fresh = False      # True after a real (fresh) login
         self._folder_cache: dict[str, dict] = {}
+        from megabot.downloaders.direct import DirectDownloader
+        self._direct = DirectDownloader()
 
     def login(self) -> None:
         self.session_fresh = self._raw.login_with_session(self._saved_session)
@@ -46,6 +70,8 @@ class MegaDownloader(BaseDownloader):
         return self._raw.session_state()
 
     def probe(self, url: str) -> dict:
+        if is_mega_direct_link(url):
+            return self._direct.probe(url)
         if RawMega.parse_folder_url(url):
             listing = self._listing(url)
             return {"name": listing["name"], "size": listing["size"],
@@ -54,6 +80,8 @@ class MegaDownloader(BaseDownloader):
 
     def download(self, url: str, dest_dir: str, progress_cb=None) -> str:
         os.makedirs(dest_dir, exist_ok=True)
+        if is_mega_direct_link(url):
+            return self._direct.download(url, dest_dir, progress_cb)
         if RawMega.parse_folder_url(url):
             return self._raw.download_folder(url, dest_dir, progress_cb,
                                              listing=self._listing(url))

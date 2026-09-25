@@ -84,12 +84,12 @@ def status_ai_analyzing(name: str) -> str:
     return f"<blockquote>🤖 <b>AI Analyzing</b>\n📁 <b>{name}</b>\nAnalyzing file structure privately…</blockquote>"
 
 
-def progress_download(name: str, done: int, total: int) -> str:
+def progress_download(name: str, done: int, total: int, host: str = "Cloud") -> str:
     percent = int(done * 100 / total) if total else 0
-    return ("<blockquote>📥 <b>Downloading from MEGA</b>\n"
+    return ("<blockquote>📥 <b>Downloading from {}</b>\n"
             f"{make_progress_bar(percent)} <b>{percent}%</b>\n"
             f"📁 <b>{name}</b>\n"
-            f"📦 {human_size(done)} / {human_size(total)}</blockquote>")
+            f"📦 {human_size(done)} / {human_size(total)}</blockquote>").format(host)
 
 
 def archive_choice(name: str, path: str) -> str:

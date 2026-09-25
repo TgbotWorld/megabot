@@ -9,61 +9,34 @@ files up to ~2 GB.
 
 ## Features
 
-- 🔗 Paste any `mega.nz` / `mega.io` **file or folder link** — the bot picks it up automatically
-- 🔐 Downloads through **your MEGA account** (email + password)
-- 📦 **Archive?** You pick: upload the archive as-is, or the bot decompresses it and uploads the contents
-  (zip, rar, 7z, tar supported — zip-slip safe extraction)
-- 🖼️ **Many images?** Merged into one **PDF** in natural order (`1, 2, 3 … 10, 100`)
-- 🎬 **Videos?** Uploaded directly, one after another, with generated thumbnails
+- 🔗 **Supported Hosts:** MEGA (`mega.nz` / `mega.io`), MediaFire (`mediafire.com`), MP4Upload (`mp4upload.com`), TeraBox (`terabox.app` / `1024tera.com`), and direct HTTP/HTTPS web links
+- 📁 **Direct Telegram Uploads:** Send documents, videos, audios, or photos directly to the bot for automatic decompression, PDF conversion, and processing
+- 🤖 **Autonomous AI Brain:** Modern reasoning engine supporting OpenRouter, Google Gemini 2.0 Flash, OpenAI (GPT-4o-mini), Groq, and DeepSeek
+- ⚙️ **Real-time AI Config via Telegram:** Change AI model, provider, temperature, and API keys directly inside Telegram using `/aiconfig` without server restarts
+- 📦 **Smart Unzip:** Decompresses ZIP, RAR, 7Z, TAR, GZ archives (with zip-slip safety)
+- 🖼️ **Image Sets:** Merged into one **PDF** in natural order (`1, 2, 3 … 10, 100`)
+- 🎬 **Videos:** Stream-ready uploads with auto-generated thumbnails
 - 📊 Live progress bar with speed + ETA, cancel button on every job
-- 🗄️ All users, jobs & settings stored in **MongoDB** (motor)
+- 🗄️ All users, jobs & settings stored in **MongoDB** (motor) with in-memory fallback
 - ⚙️ Per-user settings, per-user concurrency limits, disk-space guard, retry with backoff,
   link dedup cache (24 h), owner panel with stats/ban/broadcast
 
-## Setup
-
-### 1. Requirements
-
-- Python 3.10+
-- MongoDB (local or Atlas URI)
-- System tools: `ffmpeg` (video thumbnails), `unrar` or `unar` (RAR archives)
-
-```bash
-sudo apt install ffmpeg unrar   # Debian/Ubuntu
-```
-
-### 2. Credentials
-
-| What | Where |
-|---|---|
-| `API_ID`, `API_HASH` | https://my.telegram.org → API development tools |
-| `BOT_TOKEN` | @BotFather → `/newbot` |
-| `MEGA_EMAIL`, `MEGA_PASSWORD` | your MEGA account |
-| `OWNER_ID` | your Telegram user id (e.g. via @userinfobot) |
-
-### 3. Install & run
-
-```bash
-cd megabot
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env      # fill in your credentials
-python main.py
-```
-
-### 4. Use
-
-1. `/start`
-2. Paste one or more MEGA links
-3. Watch the live status card → answer the inline prompts → receive your files
-
-## Owner commands
+## Commands
 
 | Command | Description |
 |---|---|
-| `/stats` | users, jobs, success rate, disk usage |
-| `/ban <id>` / `/unban <id>` | block a user |
-| `/broadcast <text>` | send to all users |
+| `/start` | Start bot and view features |
+| `/agent` | AI Agent dashboard & status |
+| `/aiconfig` | Interactive AI Configuration menu (models, providers, keys, temperature) |
+| `/setmodel <id>` | Quickly switch active AI model (e.g. `google/gemini-2.0-flash`, `openai/gpt-4o-mini`) |
+| `/setkey <key>` | Save AI API key securely (message auto-deletes for privacy) |
+| `/setprovider <prov>` | Switch provider (`openrouter`, `gemini`, `openai`, `groq`, `deepseek`) |
+| `/settemp <val>` | Adjust AI temperature (`0.0` - `2.0`) |
+| `/settings` | User preferences (Archive mode, PDF merging, video thumbnails) |
+| `/cancel <id>` | Cancel an active job |
+| `/terabox <cookie>` | Set TeraBox ndus session cookie |
+| `/login` & `/logout` | Connect or disconnect custom MEGA account |
+| `/stats` (Owner) | View bot statistics (users, jobs, memory, disk) |
 
 ## Docker
 
