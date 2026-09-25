@@ -136,8 +136,166 @@ TOOL_DEFINITIONS = [
         "name": "clear_conversation_memory",
         "description": "Clear and wipe the saved conversation history / memory for the current user. Use this when the user asks to forget previous chats, clear memory, or start a fresh conversation.",
         "parameters": {}
+    },
+    {
+        "name": "summarize_memory",
+        "description": "Compact long conversation history into a short summary to save context tokens while preserving key facts. Use when memory grows large or before a long task.",
+        "parameters": {
+            "keep_last": "Number of recent turns to keep verbatim (default 6, max 20)."
+        }
+    },
+    {
+        "name": "get_agent_state",
+        "description": "Inspect the AI agent's runtime state: active model, provider, memory size, queued/running jobs. Use for self-diagnostics and status answers.",
+        "parameters": {}
     }
 ]
+
+
+# ── OpenClaw-level tool metadata: risk tiers + JSON schemas ──────────
+# risk: safe (read-only) | caution (writes/queues) | destructive (deletes/cancels)
+TOOL_METADATA: dict[str, dict] = {
+    "start_download": {"risk": "caution", "owner_only": False, "requires_confirmation": False},
+    "get_ai_config": {"risk": "safe", "owner_only": False, "requires_confirmation": False},
+    "update_ai_config": {"risk": "caution", "owner_only": True, "requires_confirmation": False},
+    "test_ai_connection": {"risk": "safe", "owner_only": False, "requires_confirmation": False},
+    "list_jobs": {"risk": "safe", "owner_only": False, "requires_confirmation": False},
+    "get_job_details": {"risk": "safe", "owner_only": False, "requires_confirmation": False},
+    "list_job_files": {"risk": "safe", "owner_only": False, "requires_confirmation": False},
+    "unzip_files": {"risk": "caution", "owner_only": False, "requires_confirmation": False},
+    "delete_job_files": {"risk": "destructive", "owner_only": False, "requires_confirmation": True},
+    "cancel_job": {"risk": "destructive", "owner_only": False, "requires_confirmation": True},
+    "clean_disk": {"risk": "destructive", "owner_only": False, "requires_confirmation": True},
+    "get_system_stats": {"risk": "safe", "owner_only": False, "requires_confirmation": False},
+    "get_user_settings": {"risk": "safe", "owner_only": False, "requires_confirmation": False},
+    "update_user_setting": {"risk": "caution", "owner_only": False, "requires_confirmation": False},
+    "clear_cache": {"risk": "caution", "owner_only": False, "requires_confirmation": False},
+    "get_account_info": {"risk": "safe", "owner_only": False, "requires_confirmation": False},
+    "logout_mega_account": {"risk": "caution", "owner_only": False, "requires_confirmation": False},
+    "set_terabox_cookie": {"risk": "caution", "owner_only": False, "requires_confirmation": False},
+    "clear_conversation_memory": {"risk": "caution", "owner_only": False, "requires_confirmation": False},
+    "summarize_memory": {"risk": "safe", "owner_only": False, "requires_confirmation": False},
+    "get_agent_state": {"risk": "safe", "owner_only": False, "requires_confirmation": False},
+}
+
+# JSON-Schema input specs for native function-calling (OpenAI `tools` parameter).
+# Kept separate from legacy `parameters` dicts so existing tests stay green.
+TOOL_SCHEMAS: dict[str, dict] = {
+    "start_download": {
+        "type": "object",
+        "properties": {
+            "urls": {"type": "string", "description": "One URL or free text containing URLs"},
+            "instruction": {"type": "string", "description": "Processing instructions"},
+        },
+        "required": ["urls"],
+    },
+    "get_ai_config": {"type": "object", "properties": {}},
+    "update_ai_config": {
+        "type": "object",
+        "properties": {
+            "key": {"type": "string", "enum": ["model", "api_key", "provider", "base_url", "temperature"]},
+            "value": {"type": "string"},
+        },
+        "required": ["key", "value"],
+    },
+    "test_ai_connection": {"type": "object", "properties": {}},
+    "list_jobs": {
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "default": "all"},
+            "limit": {"type": "integer", "default": 5, "minimum": 1, "maximum": 10},
+        },
+    },
+    "get_job_details": {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]},
+    "list_job_files": {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]},
+    "unzip_files": {
+        "type": "object",
+        "properties": {
+            "job_id": {"type": "string"},
+            "enable_auto_unzip": {"type": "boolean"},
+        },
+    },
+    "delete_job_files": {"type": "object", "properties": {"job_id": {"type": "string"}}},
+    "cancel_job": {"type": "object", "properties": {"job_id": {"type": "string"}}},
+    "clean_disk": {"type": "object", "properties": {}},
+    "get_system_stats": {"type": "object", "properties": {}},
+    "get_user_settings": {"type": "object", "properties": {}},
+    "update_user_setting": {
+        "type": "object",
+        "properties": {"key": {"type": "string"}, "value": {}},
+        "required": ["key", "value"],
+    },
+    "clear_cache": {"type": "object", "properties": {}},
+    "get_account_info": {"type": "object", "properties": {}},
+    "logout_mega_account": {"type": "object", "properties": {}},
+    "set_terabox_cookie": {
+        "type": "object",
+        "properties": {"cookie": {"type": "string"}, "scope": {"type": "string"}},
+        "required": ["cookie"],
+    },
+    "clear_conversation_memory": {"type": "object", "properties": {}},
+    "summarize_memory": {
+        "type": "object",
+        "properties": {"keep_last": {"type": "integer", "default": 6, "minimum": 2, "maximum": 20}},
+    },
+    "get_agent_state": {"type": "object", "properties": {}},
+}
+
+
+def get_tool_def(name: str) -> dict | None:
+    for t in TOOL_DEFINITIONS:
+        if t.get("name") == name:
+            return t
+    return None
+
+
+def get_tool_metadata(name: str) -> dict:
+    return TOOL_METADATA.get(name, {"risk": "caution", "owner_only": False,
+                                   "requires_confirmation": False})
+
+
+def to_openai_tools() -> list[dict]:
+    """Convert registry to OpenAI function-calling schema."""
+    out = []
+    for t in TOOL_DEFINITIONS:
+        name = t["name"]
+        out.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": t.get("description", ""),
+                "parameters": TOOL_SCHEMAS.get(name, {"type": "object", "properties": {}}),
+            },
+        })
+    return out
+
+
+def validate_tool_args(tool_name: str, params: dict) -> tuple[bool, dict | str]:
+    """Lightweight argument validation + normalization. Returns (ok, cleaned|error)."""
+    params = dict(params or {})
+    schema = TOOL_SCHEMAS.get(tool_name, {})
+    for req in schema.get("required", []):
+        if req not in params or params[req] in (None, ""):
+            # start_download accepts `urls` as str or list; be lenient on empty check
+            if tool_name == "start_download" and req == "urls" and params.get("urls"):
+                continue
+            return False, f"Missing required parameter '{req}' for tool '{tool_name}'."
+    if tool_name == "list_jobs":
+        try:
+            lim = int(params.get("limit", 5))
+        except (TypeError, ValueError):
+            lim = 5
+        params["limit"] = max(1, min(lim, 10))
+    if tool_name == "summarize_memory":
+        try:
+            k = int(params.get("keep_last", 6))
+        except (TypeError, ValueError):
+            k = 6
+        params["keep_last"] = max(2, min(k, 20))
+    if tool_name == "update_ai_config":
+        if str(params.get("key", "")).lower() not in ("model", "api_key", "provider", "base_url", "temperature"):
+            return False, "Invalid key. Allowed: model, api_key, provider, base_url, temperature."
+    return True, params
 
 
 async def execute_tool(tool_name: str, params: dict, context: dict) -> dict:
@@ -150,7 +308,19 @@ async def execute_tool(tool_name: str, params: dict, context: dict) -> dict:
     client = context.get("client")
     chat_id = context.get("chat_id")
 
+    import time as _t
+    _started = _t.time()
     try:
+        # ── OpenClaw-level: validate args + enforce owner-only ──────
+        if get_tool_def(tool_name) is not None:
+            ok, cleaned = validate_tool_args(tool_name, params or {})
+            if not ok:
+                return {"status": "error", "message": cleaned}
+            params = cleaned
+            meta = get_tool_metadata(tool_name)
+            if meta.get("owner_only") and not is_owner and tool_name == "update_ai_config":
+                return {"status": "error",
+                        "message": "Only the bot owner can change global AI configuration."}
         # ── 1. start_download ────────────────────────────────
         if tool_name == "start_download":
             raw_urls = params.get("urls")
@@ -805,6 +975,37 @@ async def execute_tool(tool_name: str, params: dict, context: dict) -> dict:
                 "status": "success",
                 "message": f"Successfully cleared conversation memory ({count} message(s) forgotten).",
                 "count": count,
+            }
+
+        # ── 20. summarize_memory (OpenClaw-level compaction) ───
+        elif tool_name == "summarize_memory":
+            if not user_id:
+                return {"status": "error", "message": "User ID is required to summarize memory."}
+            keep_last = int(params.get("keep_last", 6))
+            try:
+                from megabot.ai.memory import compact_memory
+                res = await compact_memory(user_id, keep_last=keep_last)
+                return {"status": "success", **res}
+            except Exception as e:
+                return {"status": "error", "message": f"Memory compaction failed: {e}"}
+
+        # ── 21. get_agent_state (OpenClaw-level observability) ─
+        elif tool_name == "get_agent_state":
+            from megabot.ai.client import get_ai_config as _get_cfg
+            cfg = await _get_cfg(user_id)
+            masked = (cfg["api_key"][:6] + "..." + cfg["api_key"][-4:]) if cfg["api_key"] else "Not configured"
+            history = await db.get_conversation_history(user_id or 0, limit=50)
+            total_jobs = await db.count_jobs()
+            return {
+                "status": "success",
+                "provider": cfg["provider_name"],
+                "model": cfg["model"],
+                "temperature": cfg["temperature"],
+                "api_key_status": masked,
+                "is_active": cfg["is_configured"],
+                "memory_turns": len(history),
+                "jobs_total": total_jobs,
+                "running_jobs": len(job_queue.running),
             }
 
         else:

@@ -14,10 +14,17 @@ from config import OWNER_ID, MAX_JOBS_PER_USER, MAX_FILE_SIZE_MB
 from megabot.ai.client import (
     call_openrouter_text,
     call_openrouter_json,
+    call_agent_with_tools,
     get_ai_config,
     test_ai_connection,
 )
-from megabot.ai.tools import TOOL_DEFINITIONS, execute_tool
+from megabot.ai.memory import (
+    build_llm_messages,
+    build_legacy_prompt,
+    maybe_compact_memory,
+    MAX_HISTORY_TURNS as MEM_HISTORY_TURNS,
+)
+from megabot.ai.tools import TOOL_DEFINITIONS, TOOL_METADATA, execute_tool, get_tool_metadata
 from megabot.core.database import db
 from megabot.core.job_queue import job_queue
 from megabot.downloaders import extract_supported_links, is_supported_link
@@ -29,6 +36,11 @@ log = logging.getLogger(__name__)
 # Sliding conversation memory: user_id -> list of {"role": "user"|"assistant", "content": str}
 _conversation_memory = db._mem_conversations
 MAX_HISTORY_TURNS = 8
+
+# ── OpenClaw-level agent loop tuning ──────────────────────────────
+MAX_AGENT_STEPS = 8
+PARALLEL_TOOL_LIMIT = 3
+DESTRUCTIVE_TOOLS = {"clean_disk", "delete_job_files", "cancel_job"}
 
 AGENT_SYSTEM_PROMPT = f"""You are the autonomous MegaBot AI Agent on Telegram.
 You are directly connected to MegaBot's backend server with FULL AUTHORITY and DIRECT SYSTEM ACCESS to execute real tools.
@@ -78,22 +90,35 @@ CAPABILITIES & RULES:
    - When the user asks to clear cache:
      Call tool `clear_cache`.
 
-2. MULTI-STEP REASONING:
+2. MULTI-STEP REASONING (ReAct loop, OpenClaw-style):
    - If a request requires multiple steps (e.g. check jobs then unzip, or cancel then delete), call the first tool.
    - You will receive the tool output and can call the next tool or give the final reply.
+   - You may call up to 3 independent tools in parallel in one step (e.g. list_jobs + get_system_stats).
+   - Chain dependent tools across steps: inspect first (list_jobs, list_job_files, get_job_details), then act.
+   - After each tool result, decide: another tool call, or final reply. Never loop the same failing tool twice.
 
-3. CONVERSATIONAL BEHAVIOR:
+3. SAFETY & CONFIRMATION:
+   - Destructive tools (clean_disk, delete_job_files, cancel_job) require the user to have explicitly asked (e.g. "clean disk", "delete files", "cancel job").
+   - If the request is ambiguous, inspect first with a read-only tool, then ask for confirmation instead of deleting.
+
+4. CONVERSATIONAL BEHAVIOR:
    - If the user greets, chats, or asks what you can do:
      Respond warmly and clearly in Telegram HTML format (<b>, <i>, <code>).
      State that you have direct autonomous tools to download links, extract archives, clean storage, manage background jobs, and adjust settings!
 
-4. RESPONSE FORMAT (Respond with JSON only):
+5. RESPONSE FORMAT (Respond with JSON only when native function-calling is unavailable):
    To execute a tool:
    {{
      "action": "call_tool",
      "tool": "<tool_name>",
      "parameters": {{ ... }},
      "thought": "<brief reason>"
+   }}
+
+   To call several tools at once:
+   {{
+     "action": "call_tools",
+     "tool_calls": [{{"tool": "<name>", "parameters": {{ ... }}}}, ...]
    }}
 
    To reply directly to the user:
@@ -439,8 +464,52 @@ async def on_user_message(client: Client, message: Message):
     await _run_agent_turn(client, message, message.text.strip())
 
 
+async def _format_download_started(tool_res: dict) -> str:
+    jid = tool_res.get("job_id")
+    n_urls = len(tool_res.get("urls", []))
+    inst = tool_res.get("instruction", "")
+    inst_str = f"\n• <b>Instructions:</b> <i>{inst}</i>" if inst else ""
+    return (
+        f"<blockquote>🚀 <b>Download Started</b></blockquote>\n"
+        f"• <b>Job ID:</b> <code>{jid}</code>\n"
+        f"• <b>Links:</b> {n_urls} link(s)\n"
+        f"• <b>Mode:</b> Auto-extract archives active{inst_str}\n\n"
+        f"<i>Watch the live progress card above!</i>"
+    )
+
+
+async def _execute_tool_calls_parallel(tool_calls: list[dict], context: dict,
+                                       detected_links: list, user_text: str) -> list[tuple[dict, dict]]:
+    """Execute up to PARALLEL_TOOL_LIMIT tool calls concurrently."""
+    async def _one(tc: dict) -> tuple[dict, dict]:
+        name = tc.get("name", "")
+        params = tc.get("arguments", {}) or {}
+        if not isinstance(params, dict):
+            params = {}
+        if name == "start_download" and not params.get("urls") and detected_links:
+            params["urls"] = detected_links
+            if user_text and not params.get("instruction"):
+                params["instruction"] = user_text[:500]
+        try:
+            res = await execute_tool(name, params, context)
+        except Exception as e:
+            res = {"status": "error", "message": f"{name} failed: {e}"}
+        return tc, res
+
+    batch = tool_calls[:PARALLEL_TOOL_LIMIT]
+    return list(await asyncio.gather(*[_one(tc) for tc in batch]))
+
+
+def _needs_explicit_confirmation(tool_name: str, intent_names: set[str]) -> bool:
+    """Destructive tools need an explicit user intent unless they ARE the intent."""
+    meta = get_tool_metadata(tool_name)
+    if not meta.get("requires_confirmation"):
+        return False
+    return tool_name not in intent_names
+
+
 async def _run_agent_turn(client: Client, message: Message, user_text: str):
-    """Autonomous agent reasoning loop with tool execution and multi-turn context."""
+    """OpenClaw-level ReAct loop: native tools → parallel execution → observations."""
     user_id = message.from_user.id
     is_owner = (user_id == OWNER_ID)
     chat_id = message.chat.id
@@ -485,7 +554,7 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
     await client.send_chat_action(chat_id, ChatAction.TYPING)
     status_msg = await message.reply_text("🤖 <i>Agent reasoning…</i>")
 
-    # Build context with conversation history and detected links
+    # Build context with conversation history and detected links (legacy string for fallback/tests)
     recent_history = ""
     history_turns = await db.get_conversation_history(user_id, limit=MAX_HISTORY_TURNS)
     if history_turns:
@@ -503,26 +572,143 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
     if message.reply_to_message:
         rm = message.reply_to_message
         r_fn = None
-        if rm.document:
+        if getattr(rm, "document", None):
             r_fn = rm.document.file_name or "document"
-        elif rm.video:
+        elif getattr(rm, "video", None):
             r_fn = rm.video.file_name or "video.mp4"
-        elif rm.audio:
+        elif getattr(rm, "audio", None):
             r_fn = rm.audio.file_name or "audio.mp3"
-        elif rm.photo:
+        elif getattr(rm, "photo", None):
             r_fn = "photo.jpg"
         if r_fn:
             replied_media_info = f"\nUser replied to Telegram message with file '{r_fn}' (message ID: {rm.id})."
 
     current_prompt = f"User Request: {user_text}{extra_info}{replied_media_info}{recent_history}"
 
-    max_steps = 3
+    # Native messages array (OpenClaw-style) alongside the legacy string
+    try:
+        memory_summary_extra = ""
+        messages = await build_llm_messages(user_id, AGENT_SYSTEM_PROMPT,
+                                            f"{user_text}{extra_info}{replied_media_info}",
+                                            memory_summary_extra, limit=MAX_HISTORY_TURNS)
+    except Exception:
+        messages = [
+            {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+            {"role": "user", "content": current_prompt},
+        ]
+
     final_reply_text = None
-    executed_tools = set()
+    executed_tools: set[str] = set()
+    total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     intents = detect_user_intents(user_text)
+    intent_names = {n for n, _ in intents}
 
-    for step in range(max_steps):
+    def _accumulate(usage: dict):
+        for k in total_usage:
+            total_usage[k] += int((usage or {}).get(k, 0) or 0)
+
+    for step in range(1, MAX_AGENT_STEPS + 1):
+        # ── 1. Native reasoning step ──────────────────────────
+        try:
+            step_res = await call_agent_with_tools(messages)
+        except Exception as e:
+            log.warning("Native agent step %d failed: %s", step, e)
+            step_res = None
+
+        if step_res and step_res.get("action") == "call_tools" and step_res.get("tool_calls"):
+            tool_calls = step_res["tool_calls"]
+            _accumulate(step_res.get("usage", {}))
+
+            # Safety gate for destructive tools without explicit intent
+            gated = [tc for tc in tool_calls
+                     if _needs_explicit_confirmation(tc.get("name", ""), intent_names)]
+            if gated and step == 1:
+                names = ", ".join(f"<code>{tc['name']}</code>" for tc in gated)
+                final_reply_text = (
+                    "<blockquote>⚠️ <b>Confirmation needed</b></blockquote>\n"
+                    f"This will run destructive tool(s): {names}.\n"
+                    "Reply with <b>yes, proceed</b> to confirm, or rephrase to inspect first "
+                    "(e.g. <i>list my jobs</i>)."
+                )
+                break
+
+            names_str = ", ".join(f"<code>{tc.get('name')}</code>" for tc in tool_calls[:3])
+            try:
+                await status_msg.edit_text(
+                    f"⚙️ <i>Step {step}/{MAX_AGENT_STEPS} — using:</i> {names_str}…")
+            except Exception:
+                pass
+
+            for tc in tool_calls:
+                executed_tools.add(tc.get("name", ""))
+
+            results = await _execute_tool_calls_parallel(tool_calls, context, detected_links, user_text)
+
+            # Immediate finalize for successful downloads (matches legacy UX)
+            for tc, res in results:
+                if tc.get("name") == "start_download" and res.get("status") == "success":
+                    final_reply_text = await _format_download_started(res)
+                    break
+            if final_reply_text:
+                break
+
+            # Feed observations back for next reasoning step
+            obs_lines = []
+            for tc, res in results:
+                obs_lines.append(
+                    f"Tool '{tc.get('name')}' args={json.dumps(tc.get('arguments', {}))[:800]}\n"
+                    f"Result:\n{json.dumps(res, indent=2)[:2500]}")
+            messages.append({"role": "assistant",
+                             "content": f"Step {step} tool calls: {json.dumps([t.get('name') for t in tool_calls])}"})
+            messages.append({"role": "user",
+                             "content": ("Observations:\n" + "\n---\n".join(obs_lines) +
+                                         "\n\nIf the task is complete, reply to the user in Telegram HTML. "
+                                         "Otherwise call the next tool(s).")[:6000]})
+            # Also keep legacy prompt in sync for fallback path
+            current_prompt = (
+                f"Original User Request: {user_text}\n"
+                f"Step {step} tools: {json.dumps([t.get('name') for t in tool_calls])}\n"
+                f"Tool Results:\n{json.dumps([r for _, r in results], indent=2)[:3000]}\n\n"
+                "If complete, action 'reply' with Telegram HTML. Else action 'call_tool'/'call_tools'."
+            )
+            if step == MAX_AGENT_STEPS:
+                # Summarize last observations into a reply
+                summary_bits = []
+                for _tc, res in results:
+                    summary_bits.append(res.get("message", json.dumps(res)[:300]))
+                final_reply_text = (
+                    "<blockquote>🛠 <b>Task completed</b></blockquote>\n"
+                    + "\n".join(f"• {b}" for b in summary_bits[:5]))
+                break
+            continue
+
+        if step_res and step_res.get("action") == "reply" and step_res.get("response"):
+            _accumulate(step_res.get("usage", {}))
+            reply_cand = step_res["response"]
+            if is_ai_refusal(reply_cand) and intents:
+                results = []
+                for t_name, t_params in intents:
+                    executed_tools.add(t_name)
+                    try:
+                        res = await execute_tool(t_name, t_params, context)
+                        results.append(res.get("message", f"{t_name} completed."))
+                    except Exception as te:
+                        results.append(f"{t_name}: {te}")
+                final_reply_text = (
+                    "<blockquote>🛠 <b>Autonomous Action Executed</b></blockquote>\n"
+                    + "\n".join(f"• {r}" for r in results))
+                break
+            elif is_ai_refusal(reply_cand):
+                final_reply_text = (
+                    "<blockquote>🤖 <b>MegaBot Autonomous AI Agent</b></blockquote>\n"
+                    "I am directly connected to the server and have full tools to process files, extract archives, clean storage, and manage background jobs!\n\n"
+                    "💡 <i>Try commands like /cancel, /settings, /aiconfig, or send links or files directly.</i>")
+                break
+            final_reply_text = reply_cand
+            break
+
+        # ── 2. Legacy fallback (single-shot JSON, preserves old providers/tests) ──
         try:
             plan = await call_openrouter_json(AGENT_SYSTEM_PROMPT, current_prompt)
         except Exception as e:
@@ -530,8 +716,7 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
             plan = None
 
         if not plan or not isinstance(plan, dict):
-            # Fallback 1: if links are detected on step 0, ensure download starts!
-            if step == 0 and detected_links:
+            if step == 1 and detected_links:
                 executed_tools.add("start_download")
                 res = await execute_tool("start_download", {"urls": detected_links, "instruction": user_text}, context)
                 if res.get("status") == "success":
@@ -540,14 +725,11 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
                         f"• <b>Job ID:</b> <code>{res.get('job_id')}</code>\n"
                         f"• <b>Links:</b> {len(detected_links)} link(s)\n"
                         f"• <b>Extraction:</b> <i>Auto-extract archives enabled</i>\n\n"
-                        f"<i>Live progress status is running above!</i>"
-                    )
+                        f"<i>Live progress status is running above!</i>")
                 else:
                     final_reply_text = f"❌ {res.get('message')}"
                 break
-
-            # Fallback 2: if direct action intents were detected (e.g. stop jobs, clean disk, unzip)
-            if intents:
+            if intents and step == 1:
                 log.info("Executing detected intents fallback for: %s", user_text)
                 results = []
                 for t_name, t_params in intents:
@@ -559,75 +741,56 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
                         results.append(f"{t_name}: {te}")
                 final_reply_text = (
                     "<blockquote>🛠 <b>Autonomous Action Executed</b></blockquote>\n"
-                    + "\n".join(f"• {r}" for r in results)
-                )
+                    + "\n".join(f"• {r}" for r in results))
                 break
-
-            # Fallback 3: conversational response with tool-aware prompt
-            fb_text = await call_openrouter_text(
-                FALLBACK_CONVERSATIONAL_PROMPT,
-                user_text
-            )
+            fb_text = await call_openrouter_text(FALLBACK_CONVERSATIONAL_PROMPT, user_text)
             if is_ai_refusal(fb_text):
                 fb_text = (
                     "<blockquote>🤖 <b>MegaBot Autonomous AI Agent</b></blockquote>\n"
                     "I am directly connected to the server and have full tools to process files, extract archives, clean storage, and manage background jobs!\n\n"
-                    "Paste any link (MEGA, MediaFire, MP4Upload, TeraBox), upload a file, or ask me: <i>'clean disk'</i> or <i>'unzip files'</i>."
-                )
+                    "Paste any link (MEGA, MediaFire, MP4Upload, TeraBox), upload a file, or ask me: <i>'clean disk'</i> or <i>'unzip files'</i>.")
             final_reply_text = fb_text or "⚠️ I'm temporarily unable to reach the AI engine. Please try again shortly."
             break
 
         action = plan.get("action", "reply")
-
-        if action == "call_tool":
-            tool_name = plan.get("tool")
-            params = plan.get("parameters", {})
-            if not isinstance(params, dict):
-                params = {}
-
-            executed_tools.add(tool_name)
-
-            # If user sent links and model called start_download without passing URLs, auto-fill
-            if tool_name == "start_download" and not params.get("urls") and detected_links:
-                params["urls"] = detected_links
-
-            try:
-                await status_msg.edit_text(f"⚙️ <i>Using tool:</i> <code>{tool_name}</code>…")
-            except Exception:
-                pass
-
-            # Execute tool
-            tool_res = await execute_tool(tool_name, params, context)
-
-            # If tool is start_download and successful, we can finalize immediately
-            if tool_name == "start_download" and tool_res.get("status") == "success":
-                jid = tool_res.get("job_id")
-                n_urls = len(tool_res.get("urls", []))
-                inst = tool_res.get("instruction", "")
-                inst_str = f"\n• <b>Instructions:</b> <i>{inst}</i>" if inst else ""
+        if action in ("call_tool", "call_tools"):
+            # Normalize legacy single + plural shapes
+            legacy_calls: list[dict] = []
+            if action == "call_tool" and plan.get("tool"):
+                legacy_calls = [{"name": plan.get("tool"),
+                                 "arguments": plan.get("parameters", {}) or {}}]
+            elif isinstance(plan.get("tool_calls"), list):
+                for tc in plan["tool_calls"]:
+                    if isinstance(tc, dict) and (tc.get("tool") or tc.get("name")):
+                        legacy_calls.append({"name": tc.get("tool") or tc.get("name"),
+                                             "arguments": tc.get("parameters", tc.get("arguments", {})) or {}})
+            if not legacy_calls:
+                continue
+            for tc in legacy_calls:
+                executed_tools.add(tc.get("name", ""))
+            if any(_needs_explicit_confirmation(tc.get("name", ""), intent_names) for tc in legacy_calls) and step == 1:
+                names = ", ".join(f"<code>{tc['name']}</code>" for tc in legacy_calls)
                 final_reply_text = (
-                    f"<blockquote>🚀 <b>Download Started</b></blockquote>\n"
-                    f"• <b>Job ID:</b> <code>{jid}</code>\n"
-                    f"• <b>Links:</b> {n_urls} link(s)\n"
-                    f"• <b>Mode:</b> Auto-extract archives active{inst_str}\n\n"
-                    f"<i>Watch the live progress card above!</i>"
-                )
+                    "<blockquote>⚠️ <b>Confirmation needed</b></blockquote>\n"
+                    f"This will run destructive tool(s): {names}.\nReply with <b>yes, proceed</b> to confirm.")
                 break
-
-            # Otherwise, feed tool result back for next iteration
+            results = await _execute_tool_calls_parallel(legacy_calls, context, detected_links, user_text)
+            for tc, res in results:
+                if tc.get("name") == "start_download" and res.get("status") == "success":
+                    final_reply_text = await _format_download_started(res)
+                    break
+            if final_reply_text:
+                break
             current_prompt = (
                 f"Original User Request: {user_text}\n"
-                f"You executed tool '{tool_name}' with parameters {json.dumps(params)}.\n"
-                f"Tool Result:\n{json.dumps(tool_res, indent=2)}\n\n"
-                "If the task is complete, respond with action 'reply' and provide a clear, helpful response in Telegram HTML. "
-                "If another tool is needed, respond with action 'call_tool'."
-            )
-
+                f"You executed tools {json.dumps([t.get('name') for t in legacy_calls])}.\n"
+                f"Tool Results:\n{json.dumps([r for _, r in results], indent=2)[:3000]}\n\n"
+                "If complete, action 'reply' with Telegram HTML. Else action 'call_tool'.")
+            messages.append({"role": "user", "content": current_prompt[:4000]})
+            continue
         else:
-            # Action is reply
             reply_cand = plan.get("response") or plan.get("summary") or ""
             if is_ai_refusal(reply_cand) and intents:
-                log.info("Detected AI refusal in plan response for action request, executing intents directly...")
                 results = []
                 for t_name, t_params in intents:
                     executed_tools.add(t_name)
@@ -638,22 +801,24 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
                         results.append(f"{t_name}: {te}")
                 final_reply_text = (
                     "<blockquote>🛠 <b>Autonomous Action Executed</b></blockquote>\n"
-                    + "\n".join(f"• {r}" for r in results)
-                )
+                    + "\n".join(f"• {r}" for r in results))
                 break
             elif is_ai_refusal(reply_cand):
                 final_reply_text = (
                     "<blockquote>🤖 <b>MegaBot Autonomous AI Agent</b></blockquote>\n"
                     "I am directly connected to the server and have full tools to process files, extract archives, clean storage, and manage background jobs!\n\n"
-                    "💡 <i>Try commands like /cancel, /settings, /aiconfig, or send links or files directly.</i>"
-                )
+                    "💡 <i>Try commands like /cancel, /settings, /aiconfig, or send links or files directly.</i>")
                 break
             else:
-                final_reply_text = reply_cand
+                final_reply_text = reply_cand or "✅ Done."
                 break
 
     if not final_reply_text:
         final_reply_text = "✅ Done."
+
+    if any(total_usage.values()):
+        log.info("Agent turn usage: %s over %d tool(s): %s",
+                 total_usage, len(executed_tools), sorted(executed_tools))
 
     try:
         await status_msg.edit_text(final_reply_text, disable_web_page_preview=True)
@@ -668,3 +833,7 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
     if "clear_conversation_memory" not in executed_tools:
         await _add_memory(user_id, "user", user_text)
         await _add_memory(user_id, "assistant", final_reply_text)
+    try:
+        await maybe_compact_memory(user_id)
+    except Exception:
+        pass

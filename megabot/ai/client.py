@@ -1,9 +1,13 @@
 # Advanced Multi-Provider AI Client with Dynamic Runtime Configuration
+# OpenClaw-level upgrade: native function-calling, retries with backoff,
+# unified chat completion, and normalized tool-call extraction.
 import ast
+import asyncio
 import json
 import logging
 import re
 import time
+import uuid
 from typing import Any, Optional
 import aiohttp
 
@@ -11,6 +15,57 @@ from config import OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_BASE_URL
 from megabot.core.database import db
 
 log = logging.getLogger(__name__)
+
+# ── OpenClaw-level transport tuning ─────────────────────────────────
+MAX_RETRIES = 3
+BASE_BACKOFF_S = 1.0
+CHAT_TIMEOUT_S = 45
+
+
+def _auth_headers(api_key: str) -> dict:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/megabot",
+        "X-Title": "MegaBot",
+    }
+
+
+async def _post_chat(url: str, headers: dict, payload: dict,
+                     timeout_s: int = CHAT_TIMEOUT_S,
+                     retries: int = MAX_RETRIES):
+    """POST with exponential backoff. Returns (status, json_data|None, text)."""
+    last_err = ""
+    for attempt in range(1, retries + 1):
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
+                async with session.post(url, headers=headers, json=payload) as resp:
+                    if resp.status in (429, 500, 502, 503, 504) and attempt < retries:
+                        wait = BASE_BACKOFF_S * (2 ** (attempt - 1)) + 0.2 * attempt
+                        log.info("AI provider HTTP %s, retry %d/%d in %.1fs",
+                                 resp.status, attempt, retries, wait)
+                        await asyncio.sleep(wait)
+                        last_err = f"HTTP {resp.status}"
+                        continue
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        data = None
+                    text = "" if data is not None else await resp.text()
+                    return resp.status, data, text
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last_err = str(e)
+            if attempt < retries:
+                wait = BASE_BACKOFF_S * (2 ** (attempt - 1))
+                log.info("AI network error (%s), retry %d/%d in %.1fs", e, attempt, retries, wait)
+                await asyncio.sleep(wait)
+                continue
+            log.warning("Network error calling AI provider after %d attempts: %s", retries, e)
+            return 0, None, last_err
+        except Exception as e:
+            log.warning("Unexpected error during AI call: %s", e)
+            return 0, None, str(e)
+    return 0, None, last_err
 
 # Known AI Provider Presets
 PROVIDER_PRESETS = {
@@ -142,6 +197,7 @@ async def call_openrouter_json(system_prompt: str, user_prompt: str,
     """
     Send prompt to AI provider and safely extract structured JSON response.
     Includes auto-retry without response_format if provider doesn't support json mode.
+    Now backed by exponential-backoff transport.
     """
     cfg = await get_ai_config()
     if not cfg["is_configured"]:
@@ -149,15 +205,8 @@ async def call_openrouter_json(system_prompt: str, user_prompt: str,
         return None
 
     url = format_chat_url(cfg["base_url"])
-    headers = {
-        "Authorization": f"Bearer {cfg['api_key']}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/megabot",
-        "X-Title": "MegaBot",
-    }
-
+    headers = _auth_headers(cfg["api_key"])
     temp = temperature if temperature is not None else cfg["temperature"]
-
     payload = {
         "model": cfg["model"],
         "messages": [
@@ -168,46 +217,32 @@ async def call_openrouter_json(system_prompt: str, user_prompt: str,
         "response_format": {"type": "json_object"},
     }
 
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
-            # First attempt with json_object response format
-            async with session.post(url, headers=headers, json=payload) as resp:
-                if resp.status == 400:
-                    err_text = await resp.text()
-                    # Some models (e.g. certain Llama / Gemini / free models) don't support response_format
-                    if "response_format" in err_text.lower() or "json_object" in err_text.lower():
-                        log.info("Model %s does not support response_format, retrying without it...", cfg["model"])
-                        payload.pop("response_format", None)
-                        async with session.post(url, headers=headers, json=payload) as retry_resp:
-                            if retry_resp.status != 200:
-                                log.warning("AI provider retry failed HTTP %s: %s", retry_resp.status, (await retry_resp.text())[:300])
-                                return None
-                            data = await retry_resp.json()
-                    else:
-                        log.warning("AI API returned HTTP 400: %s", err_text[:300])
-                        return None
-                elif resp.status != 200:
-                    err_body = await resp.text()
-                    log.warning("AI API returned HTTP %s: %s", resp.status, err_body[:300])
-                    return None
-                else:
-                    data = await resp.json()
-
-            choices = data.get("choices", [])
-            if not choices:
-                return None
-            content = choices[0].get("message", {}).get("content", "")
-            if not content:
-                return None
-
-            return _parse_json_content(content)
-
-    except aiohttp.ClientError as e:
-        log.warning("Network error calling AI provider: %s", e)
+    status, data, text = await _post_chat(url, headers, payload)
+    if status == 400 and ("response_format" in (text or "").lower()
+                          or "json_object" in (text or "").lower()):
+        # Some models (e.g. certain Llama / Gemini / free models) don't support response_format
+        log.info("Model %s does not support response_format, retrying without it...", cfg["model"])
+        payload.pop("response_format", None)
+        status, data, text = await _post_chat(url, headers, payload)
+    if status != 200 or not data:
+        log.warning("AI API returned HTTP %s: %s", status, (text or "")[:300])
         return None
-    except Exception as e:
-        log.warning("Unexpected error during AI JSON call: %s", e)
+
+    choices = (data or {}).get("choices", [])
+    if not choices:
         return None
+    content = choices[0].get("message", {}).get("content", "")
+    if not content:
+        # Native tool_calls payload may carry the JSON instead
+        tool_calls = choices[0].get("message", {}).get("tool_calls", [])
+        if tool_calls:
+            try:
+                args = tool_calls[0].get("function", {}).get("arguments", "{}")
+                return json.loads(args) if isinstance(args, str) else dict(args)
+            except Exception:
+                return None
+        return None
+    return _parse_json_content(content)
 
 
 def _parse_json_content(raw: str) -> dict | None:
@@ -258,15 +293,8 @@ async def call_openrouter_text(system_prompt: str, user_prompt: str,
         return None
 
     url = format_chat_url(cfg["base_url"])
-    headers = {
-        "Authorization": f"Bearer {cfg['api_key']}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/megabot",
-        "X-Title": "MegaBot",
-    }
-
+    headers = _auth_headers(cfg["api_key"])
     temp = temperature if temperature is not None else cfg["temperature"]
-
     payload = {
         "model": cfg["model"],
         "messages": [
@@ -276,21 +304,12 @@ async def call_openrouter_text(system_prompt: str, user_prompt: str,
         "temperature": temp,
     }
 
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
-            async with session.post(url, headers=headers, json=payload) as resp:
-                if resp.status != 200:
-                    err_body = await resp.text()
-                    log.warning("AI provider returned HTTP %s: %s", resp.status, err_body[:300])
-                    return None
-
-                data = await resp.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content")
-                return content.strip() if content else None
-
-    except Exception as e:
-        log.warning("AI text call error: %s", e)
+    status, data, text = await _post_chat(url, headers, payload)
+    if status != 200 or not data:
+        log.warning("AI provider returned HTTP %s: %s", status, (text or "")[:300])
         return None
+    content = (data.get("choices", [{}])[0].get("message", {}).get("content"))
+    return content.strip() if content else None
 
 
 async def test_ai_connection(config_override: Optional[dict] = None) -> dict:
@@ -326,37 +345,168 @@ async def test_ai_connection(config_override: Optional[dict] = None) -> dict:
     }
 
     start = time.time()
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
-            async with session.post(url, headers=headers, json=payload) as resp:
-                latency = int((time.time() - start) * 1000)
-                if resp.status == 200:
-                    data = await resp.json()
-                    choices = data.get("choices", [])
-                    reply = choices[0].get("message", {}).get("content", "").strip() if choices else "OK"
-                    return {
-                        "success": True,
-                        "latency_ms": latency,
-                        "model": cfg["model"],
-                        "provider": cfg.get("provider_name", cfg.get("provider", "AI")),
-                        "reply": reply,
-                        "error": "",
-                    }
-                else:
-                    err_txt = await resp.text()
-                    return {
-                        "success": False,
-                        "latency_ms": latency,
-                        "model": cfg["model"],
-                        "provider": cfg.get("provider_name", cfg.get("provider", "AI")),
-                        "error": f"HTTP {resp.status}: {err_txt[:180]}",
-                    }
-    except Exception as e:
-        latency = int((time.time() - start) * 1000)
+    status, data, text = await _post_chat(url, headers, payload, timeout_s=20, retries=2)
+    latency = int((time.time() - start) * 1000)
+    if status == 200 and data:
+        choices = data.get("choices", [])
+        reply = choices[0].get("message", {}).get("content", "").strip() if choices else "OK"
         return {
-            "success": False,
+            "success": True,
             "latency_ms": latency,
-            "model": cfg.get("model", ""),
+            "model": cfg["model"],
             "provider": cfg.get("provider_name", cfg.get("provider", "AI")),
-            "error": str(e),
+            "reply": reply,
+            "error": "",
         }
+    return {
+        "success": False,
+        "latency_ms": latency,
+        "model": cfg.get("model", ""),
+        "provider": cfg.get("provider_name", cfg.get("provider", "AI")),
+        "error": f"HTTP {status}: {(text or '')[:180]}" if status else (text or "connection failed")[:180],
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  OpenClaw-level: native function-calling + normalized ReAct output
+# ══════════════════════════════════════════════════════════════════
+
+def build_openai_tools() -> list[dict]:
+    """Return OpenAI function-calling tool schemas derived from the registry."""
+    try:
+        from megabot.ai.tools import to_openai_tools
+        return to_openai_tools()
+    except Exception:
+        return []
+
+
+def _normalize_tool_calls(message: dict) -> list[dict]:
+    """Normalize native `tool_calls` into [{id, name, arguments}]."""
+    out: list[dict] = []
+    for tc in message.get("tool_calls", []) or []:
+        fn = tc.get("function", {}) or {}
+        name = fn.get("name", "")
+        raw_args = fn.get("arguments", "{}")
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args) if raw_args.strip() else {}
+            except Exception:
+                parsed = _parse_json_content(raw_args)
+                args = parsed if isinstance(parsed, dict) else {}
+        elif isinstance(raw_args, dict):
+            args = raw_args
+        else:
+            args = {}
+        if name:
+            out.append({
+                "id": tc.get("id") or f"call_{uuid.uuid4().hex[:8]}",
+                "name": name,
+                "arguments": args,
+            })
+    return out
+
+
+def _extract_legacy_tool_calls(content: str) -> list[dict]:
+    """Fallback: parse legacy JSON `{"action":"call_tool",...}` from text."""
+    parsed = _parse_json_content(content or "")
+    if not isinstance(parsed, dict):
+        return []
+    # Direct tool-call shape
+    if parsed.get("action") == "call_tool" and parsed.get("tool"):
+        params = parsed.get("parameters", {})
+        return [{
+            "id": f"call_{uuid.uuid4().hex[:8]}",
+            "name": parsed["tool"],
+            "arguments": params if isinstance(params, dict) else {},
+            "thought": parsed.get("thought", ""),
+        }]
+    # Plural shape: {"tool_calls": [{"tool":..., "parameters":...}]}
+    if isinstance(parsed.get("tool_calls"), list):
+        out = []
+        for tc in parsed["tool_calls"]:
+            if isinstance(tc, dict) and (tc.get("tool") or tc.get("name")):
+                out.append({
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "name": tc.get("tool") or tc.get("name"),
+                    "arguments": tc.get("parameters", tc.get("arguments", {})) or {},
+                })
+        return out
+    return []
+
+
+async def chat_completion(messages: list[dict],
+                          temperature: Optional[float] = None,
+                          max_tokens: Optional[int] = None,
+                          tools: Optional[list[dict]] = None,
+                          tool_choice: str = "auto",
+                          json_mode: bool = False,
+                          timeout_s: int = CHAT_TIMEOUT_S) -> dict | None:
+    """Unified chat completion with optional native tools and usage stats."""
+    cfg = await get_ai_config()
+    if not cfg["is_configured"]:
+        return None
+    url = format_chat_url(cfg["base_url"])
+    headers = _auth_headers(cfg["api_key"])
+    payload: dict[str, Any] = {
+        "model": cfg["model"],
+        "messages": messages,
+        "temperature": cfg["temperature"] if temperature is None else temperature,
+    }
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = tool_choice
+    elif json_mode:
+        payload["response_format"] = {"type": "json_object"}
+
+    status, data, text = await _post_chat(url, headers, payload, timeout_s=timeout_s)
+    if status == 400 and tools and ("tool" in (text or "").lower()):
+        # Provider doesn't support native tools → retry without them (legacy JSON)
+        log.info("Provider rejected native tools, retrying in legacy JSON mode")
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+        payload["response_format"] = {"type": "json_object"}
+        status, data, text = await _post_chat(url, headers, payload, timeout_s=timeout_s)
+    if status != 200 or not data:
+        log.warning("chat_completion HTTP %s: %s", status, (text or "")[:300])
+        return None
+    choices = data.get("choices", [])
+    if not choices:
+        return None
+    msg = choices[0].get("message", {}) or {}
+    usage = data.get("usage", {}) or {}
+    return {
+        "content": msg.get("content") or "",
+        "tool_calls": _normalize_tool_calls(msg),
+        "raw_message": msg,
+        "usage": {
+            "prompt_tokens": usage.get("prompt_tokens", 0),
+            "completion_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        },
+        "model": cfg["model"],
+    }
+
+
+async def call_agent_with_tools(messages: list[dict],
+                                temperature: Optional[float] = None,
+                                max_tokens: Optional[int] = None) -> dict | None:
+    """OpenClaw-style single reasoning step: native tools first, legacy JSON fallback."""
+    tools = build_openai_tools()
+    res = await chat_completion(messages, temperature=temperature,
+                                max_tokens=max_tokens, tools=tools or None)
+    if res is None:
+        return None
+    if res["tool_calls"]:
+        return {"action": "call_tools", "tool_calls": res["tool_calls"],
+                "content": res["content"], "usage": res["usage"]}
+    legacy = _extract_legacy_tool_calls(res["content"])
+    if legacy:
+        return {"action": "call_tools", "tool_calls": legacy,
+                "content": res["content"], "usage": res["usage"]}
+    parsed = _parse_json_content(res["content"])
+    if isinstance(parsed, dict) and parsed.get("action") == "reply":
+        return {"action": "reply", "response": parsed.get("response", res["content"]),
+                "usage": res["usage"]}
+    return {"action": "reply", "response": res["content"], "usage": res["usage"]}
