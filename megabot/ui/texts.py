@@ -40,6 +40,7 @@ HELP = """<blockquote>{} <b>MegaBot AI Guide</b></blockquote>
 <b>Commands:</b>
 /start — Welcome & features
 /agent — AI Agent dashboard & status
+/clearmemory — Clear AI conversation memory
 /aiconfig — Interactive AI configuration menu
 /setmodel &lt;model&gt; — Change active AI model
 /setprovider &lt;provider&gt; — Switch preset or set custom provider

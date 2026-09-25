@@ -131,6 +131,11 @@ TOOL_DEFINITIONS = [
             "cookie": "The TeraBox ndus cookie value (required).",
             "scope": "Optional scope: 'global' (bot-wide for all users, owner only) or 'personal' (current user only). Default is 'global' for owner, 'personal' for users."
         }
+    },
+    {
+        "name": "clear_conversation_memory",
+        "description": "Clear and wipe the saved conversation history / memory for the current user. Use this when the user asks to forget previous chats, clear memory, or start a fresh conversation.",
+        "parameters": {}
     }
 ]
 
@@ -673,6 +678,17 @@ async def execute_tool(tool_name: str, params: dict, context: dict) -> dict:
             from megabot.ai.client import test_ai_connection
             res = await test_ai_connection()
             return res
+
+        # ── 19. clear_conversation_memory ────────────────────
+        elif tool_name == "clear_conversation_memory":
+            if not user_id:
+                return {"status": "error", "message": "User ID is required to clear conversation memory."}
+            count = await db.clear_conversation_history(user_id)
+            return {
+                "status": "success",
+                "message": f"Successfully cleared conversation memory ({count} message(s) forgotten).",
+                "count": count,
+            }
 
         else:
             return {"status": "error", "message": f"Unknown tool: '{tool_name}'"}

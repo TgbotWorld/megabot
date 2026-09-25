@@ -278,11 +278,16 @@ async def settemp_cmd(client: Client, message: Message):
 @Client.on_callback_query(filters.regex(r"^aiconf:(.*)$"))
 async def aiconfig_callbacks(client: Client, cq: CallbackQuery):
     user_id = cq.from_user.id
+    action = cq.matches[0].group(1)
+
+    if action == "clearmem":
+        count = await db.clear_conversation_history(user_id)
+        await cq.answer(f"🧠 AI Memory cleared ({count} turns wiped)!", show_alert=True)
+        return
+
     if not _is_authorized(user_id):
         await cq.answer("🚫 Owner only.", show_alert=True)
         return
-
-    action = cq.matches[0].group(1)
 
     if action == "main":
         await cq.answer()

@@ -1,5 +1,6 @@
 # MongoDB layer — motor async singleton (pattern mirrors AniwatchTvdl/cantarella/core/database.py)
 import logging
+from collections import defaultdict
 from datetime import datetime, timedelta
 
 import motor.motor_asyncio
@@ -25,10 +26,12 @@ class Database:
                 self.link_cache = self.db["link_cache"]
                 self.mega_accounts = self.db["mega_accounts"]
                 self.mega_sessions = self.db["mega_sessions"]
+                self.conversations = self.db["conversations"]
             except Exception as e:
                 self.client = self.db = None
                 self.users = self.jobs = self.settings = self.link_cache = None
                 self.mega_accounts = self.mega_sessions = None
+                self.conversations = None
                 logging.error("Failed to initialize MongoDB client: %s", e)
         else:
             # Graceful no-op when MONGO_URL is not set
@@ -36,8 +39,10 @@ class Database:
             self.users = self.jobs = self.settings = self.link_cache = None
             self.mega_accounts = None
             self.mega_sessions = None
+            self.conversations = None
             logging.warning("MONGO_URL not set — database features will be disabled.")
         self._mem_config = {}
+        self._mem_conversations = defaultdict(list)
 
     # ══════════════════════════════════════════════════════
     #  USERS
@@ -342,6 +347,57 @@ class Database:
             return res.deleted_count > 0
         except Exception:
             return False
+
+    # ══════════════════════════════════════════════════════
+    #  CONVERSATIONS  (persistent multi-turn AI memory)
+    # ══════════════════════════════════════════════════════
+
+    async def add_conversation_message(self, user_id: int, role: str, content: str):
+        """Record a conversation turn ('user' or 'assistant') for a user."""
+        if not content:
+            return
+        doc = {
+            "user_id": int(user_id),
+            "role": role,
+            "content": str(content)[:1000],
+            "created_at": datetime.utcnow(),
+        }
+        uid = int(user_id)
+        self._mem_conversations[uid].append(doc)
+        if len(self._mem_conversations[uid]) > 50:
+            self._mem_conversations[uid] = self._mem_conversations[uid][-50:]
+
+        if self.conversations is not None:
+            try:
+                await self.conversations.insert_one(doc)
+            except Exception as e:
+                logging.warning("Error saving conversation turn to MongoDB: %s", e)
+
+    async def get_conversation_history(self, user_id: int, limit: int = 10) -> list[dict]:
+        """Get recent conversation turns for a user, ordered chronologically (oldest to newest)."""
+        uid = int(user_id)
+        if self.conversations is not None:
+            try:
+                cursor = self.conversations.find({"user_id": uid}).sort("created_at", -1).limit(limit)
+                docs = await cursor.to_list(length=limit)
+                docs.reverse()
+                return [{"role": d["role"], "content": d["content"]} for d in docs]
+            except Exception as e:
+                logging.warning("Error retrieving conversation history from MongoDB: %s", e)
+        history = self._mem_conversations.get(uid, [])
+        return [{"role": d["role"], "content": d["content"]} for d in history[-limit:]]
+
+    async def clear_conversation_history(self, user_id: int) -> int:
+        """Delete all conversation memory for a user. Returns count of deleted messages."""
+        uid = int(user_id)
+        deleted_count = len(self._mem_conversations.pop(uid, []))
+        if self.conversations is not None:
+            try:
+                res = await self.conversations.delete_many({"user_id": uid})
+                deleted_count = res.deleted_count
+            except Exception as e:
+                logging.warning("Error clearing conversation history in MongoDB: %s", e)
+        return deleted_count
 
 
 # ── Singleton instance ───────────────────────────────────────

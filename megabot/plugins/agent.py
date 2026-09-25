@@ -27,7 +27,7 @@ from megabot.ui import texts
 log = logging.getLogger(__name__)
 
 # Sliding conversation memory: user_id -> list of {"role": "user"|"assistant", "content": str}
-_conversation_memory = defaultdict(list)
+_conversation_memory = db._mem_conversations
 MAX_HISTORY_TURNS = 8
 
 AGENT_SYSTEM_PROMPT = f"""You are the autonomous MegaBot AI Agent on Telegram.
@@ -35,7 +35,7 @@ You are directly connected to MegaBot's backend server with FULL AUTHORITY and D
 
 CRITICAL ANTI-REFUSAL DIRECTIVES:
 1. YOU ARE NOT A TEXT-ONLY ASSISTANT. You have REAL backend tools executing on this server.
-2. NEVER REFUSE ANY ACTION claiming you lack filesystem access, device access, process controls, or physical capabilities. That is completely FALSE for MegaBot.
+2. NEVER REFUSE ANY ACTION claiming you lack filesystem access, device access, process controls, memory management, or physical capabilities. That is completely FALSE for MegaBot.
    - User asks to stop/cancel background jobs? You HAVE the `cancel_job` tool!
    - User asks to clean disk/free up storage/free up desk? You HAVE the `clean_disk` tool!
    - User asks to unzip/extract archives? You HAVE the `unzip_files` tool!
@@ -43,6 +43,7 @@ CRITICAL ANTI-REFUSAL DIRECTIVES:
    - User asks about jobs or status? You HAVE the `list_jobs` tool!
    - User asks to download links? You HAVE the `start_download` tool!
    - User asks to configure AI/keys/models? You HAVE the `update_ai_config` tool!
+   - User asks to clear memory/forget conversation/wipe history? You HAVE the `clear_conversation_memory` tool!
 3. YOU MUST ALWAYS USE YOUR TOOLS. Whenever the user asks to perform an action, return a JSON tool call (`"action": "call_tool"`). NEVER answer with "I cannot perform this action" or "I am a text-based AI without system controls".
 
 AVAILABLE TOOLS:
@@ -54,6 +55,8 @@ CAPABILITIES & RULES:
      Call tool `start_download` with the URLs and any instructions.
    - When the user asks to change or check AI settings (model, API key, provider, temperature, base_url):
      Call tool `update_ai_config` or `get_ai_config`.
+   - When the user asks to clear memory, forget conversation, or reset chat history:
+     Call tool `clear_conversation_memory`.
    - When the user asks to unzip, decompress, or extract archives (ZIP, RAR, 7Z, TAR, GZ):
      Call tool `unzip_files`.
    - When the user asks to delete job files from server disk:
@@ -163,6 +166,15 @@ def detect_user_intents(text: str) -> list[tuple[str, dict]]:
     ]):
         intents.append(("list_jobs", {}))
 
+    # Clear conversation memory
+    if any(k in text_l for k in [
+        "clear memory", "reset memory", "forget chat", "forget conversation",
+        "clear chat", "clear conversation", "wipe memory", "delete chat history",
+        "forget everything", "reset chat", "clear our conversation",
+        "forget what we talked about", "forget our conversation"
+    ]):
+        intents.append(("clear_conversation_memory", {}))
+
     return intents
 
 
@@ -191,14 +203,25 @@ def is_ai_refusal(text: str) -> bool:
     return any(p in tl for p in refusal_phrases)
 
 
-def _add_memory(user_id: int, role: str, content: str):
-    """Store recent turn in per-user conversation memory."""
+async def _add_memory(user_id: int, role: str, content: str):
+    """Store recent turn in persistent conversation memory."""
     if not content:
         return
-    history = _conversation_memory[user_id]
-    history.append({"role": role, "content": str(content)[:800]})
-    if len(history) > MAX_HISTORY_TURNS * 2:
-        _conversation_memory[user_id] = history[-MAX_HISTORY_TURNS * 2:]
+    await db.add_conversation_message(user_id, role, content)
+
+
+@Client.on_message(filters.command(["clearmemory", "resetmemory", "forget"]) & filters.private & filters.incoming & ~filters.bot)
+async def clear_memory_command(client: Client, message: Message):
+    """Clear AI agent conversation history for the user."""
+    if not message.from_user or message.from_user.is_bot:
+        return
+    user_id = message.from_user.id
+    count = await db.clear_conversation_history(user_id)
+    await message.reply_text(
+        "<blockquote>🧠 <b>AI Memory Cleared</b></blockquote>\n"
+        f"Erased <b>{count}</b> message(s) from conversation memory.\n"
+        "Starting with a fresh context!"
+    )
 
 
 @Client.on_message(filters.command(["agent", "ai"]) & filters.private & filters.incoming & ~filters.bot)
@@ -222,6 +245,7 @@ async def agent_command(client: Client, message: Message):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⚙️ Configure AI Settings", callback_data="aiconf:main")],
         [InlineKeyboardButton("🧪 Test Connection", callback_data="aiconf:test")],
+        [InlineKeyboardButton("🧠 Clear Memory", callback_data="aiconf:clearmem")],
     ])
 
     if not cfg["is_configured"]:
@@ -387,7 +411,8 @@ async def on_user_media(client: Client, message: Message):
         "start", "help", "settings", "stats", "ban", "unban",
         "broadcast", "login", "logout", "cancel", "agent", "ai",
         "terabox", "cookie", "aiconfig", "aiconf", "setmodel",
-        "setkey", "setprovider", "settemp"
+        "setkey", "setprovider", "settemp", "seturl", "clearmemory",
+        "resetmemory", "forget"
     ])
 )
 async def on_user_message(client: Client, message: Message):
@@ -459,9 +484,10 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
 
     # Build context with conversation history and detected links
     recent_history = ""
-    if _conversation_memory[user_id]:
+    history_turns = await db.get_conversation_history(user_id, limit=MAX_HISTORY_TURNS)
+    if history_turns:
         h_lines = []
-        for turn in _conversation_memory[user_id][-6:]:
+        for turn in history_turns:
             pfx = "User" if turn["role"] == "user" else "AI Agent"
             h_lines.append(f"{pfx}: {turn['content']}")
         recent_history = "\nRecent Conversation History:\n" + "\n".join(h_lines)
@@ -474,6 +500,7 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
 
     max_steps = 3
     final_reply_text = None
+    executed_tools = set()
 
     intents = detect_user_intents(user_text)
 
@@ -487,6 +514,7 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
         if not plan or not isinstance(plan, dict):
             # Fallback 1: if links are detected on step 0, ensure download starts!
             if step == 0 and detected_links:
+                executed_tools.add("start_download")
                 res = await execute_tool("start_download", {"urls": detected_links, "instruction": user_text}, context)
                 if res.get("status") == "success":
                     final_reply_text = (
@@ -505,6 +533,7 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
                 log.info("Executing detected intents fallback for: %s", user_text)
                 results = []
                 for t_name, t_params in intents:
+                    executed_tools.add(t_name)
                     try:
                         res = await execute_tool(t_name, t_params, context)
                         results.append(res.get("message", f"{t_name} completed."))
@@ -537,6 +566,8 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
             params = plan.get("parameters", {})
             if not isinstance(params, dict):
                 params = {}
+
+            executed_tools.add(tool_name)
 
             # If user sent links and model called start_download without passing URLs, auto-fill
             if tool_name == "start_download" and not params.get("urls") and detected_links:
@@ -581,6 +612,7 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
                 log.info("Detected AI refusal in plan response for action request, executing intents directly...")
                 results = []
                 for t_name, t_params in intents:
+                    executed_tools.add(t_name)
                     try:
                         res = await execute_tool(t_name, t_params, context)
                         results.append(res.get("message", f"{t_name} completed."))
@@ -614,6 +646,7 @@ async def _run_agent_turn(client: Client, message: Message, user_text: str):
         except Exception:
             pass
 
-    # Save to memory
-    _add_memory(user_id, "user", user_text)
-    _add_memory(user_id, "assistant", final_reply_text)
+    # Save to memory (skip if memory was explicitly cleared during this turn)
+    if "clear_conversation_memory" not in executed_tools:
+        await _add_memory(user_id, "user", user_text)
+        await _add_memory(user_id, "assistant", final_reply_text)

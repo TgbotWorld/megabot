@@ -45,10 +45,15 @@ app = Client(
 
 async def set_bot_commands(client):
     try:
-        from pyrogram.types import BotCommand
+        from pyrogram.types import (
+            BotCommand,
+            BotCommandScopeDefault,
+            BotCommandScopeAllPrivateChats,
+        )
         commands = [
             BotCommand("start", "Start the bot & view features"),
             BotCommand("agent", "Check AI Agent status & dashboard"),
+            BotCommand("clearmemory", "Clear AI conversation memory"),
             BotCommand("aiconfig", "AI Configuration menu (models, keys, providers)"),
             BotCommand("setmodel", "Change active AI model"),
             BotCommand("setprovider", "Change AI provider"),
@@ -63,7 +68,11 @@ async def set_bot_commands(client):
             BotCommand("help", "Help & command guide"),
             BotCommand("stats", "Bot statistics (owner)"),
         ]
-        await client.set_bot_commands(commands)
+        await client.set_bot_commands(commands, scope=BotCommandScopeDefault())
+        try:
+            await client.set_bot_commands(commands, scope=BotCommandScopeAllPrivateChats())
+        except Exception:
+            pass
         logging.info("✅ Successfully registered %d bot commands with Telegram", len(commands))
         return True
     except Exception as e:
