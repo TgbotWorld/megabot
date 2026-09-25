@@ -45,11 +45,7 @@ app = Client(
 
 async def set_bot_commands(client):
     try:
-        from pyrogram.types import (
-            BotCommand,
-            BotCommandScopeDefault,
-            BotCommandScopeAllPrivateChats,
-        )
+        from pyrogram.types import BotCommand
         commands = [
             BotCommand("start", "Start the bot & view features"),
             BotCommand("agent", "Check AI Agent status & dashboard"),
@@ -66,10 +62,8 @@ async def set_bot_commands(client):
             BotCommand("help", "Help & command guide"),
             BotCommand("stats", "Bot statistics (owner)"),
         ]
-        # Register for both default scope and all private chats scope
-        await client.set_bot_commands(commands, scope=BotCommandScopeDefault())
-        await client.set_bot_commands(commands, scope=BotCommandScopeAllPrivateChats())
-        logging.info("✅ Successfully registered %d bot commands with Telegram in Default & Private scopes", len(commands))
+        await client.set_bot_commands(commands)
+        logging.info("✅ Successfully registered %d bot commands with Telegram", len(commands))
         return True
     except Exception as e:
         logging.warning("Setting bot commands skipped: %s", e)
