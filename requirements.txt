@@ -5,6 +5,8 @@ dnspython>=2.4.0
 python-dotenv
 aiohttp
 aiofiles
+requests
+pycryptodome
 psutil
 mega.py
 Pillow
